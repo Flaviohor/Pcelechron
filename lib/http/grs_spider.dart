@@ -412,7 +412,7 @@ class GrsSpider implements Spider {
       // 本科生课
       Future<String?> handleTimetable(season) async {
         if (cancelTimetableFetch) {
-          return Future.value("已取消");
+          return "已取消";
         }
         try {
           var value = await _fetchWithRetry(
@@ -436,8 +436,7 @@ class GrsSpider implements Spider {
           }
           return value.item1?.toString();
         } on Object catch (error, stackTrace) {
-          return Future.value(
-              _describeRefreshFailure(error, stackTrace, source: '课表'));
+          return _describeRefreshFailure(error, stackTrace, source: '课表');
         }
       }
 
