@@ -10,5 +10,11 @@
     <true/>
 	<key>com.apple.security.network.client</key>
 	<true/>
+	<!-- 同 Release.entitlements 的注释：声明 app 自己的 keychain access group，
+	     避免每次启动都被 macOS 弹钥匙串授权框。debug 用独立的 group 后缀。 -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)group.top.celechron.celechron.debug</string>
+	</array>
 </dict>
 </plist>

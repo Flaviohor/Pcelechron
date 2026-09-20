@@ -6,5 +6,21 @@
 	<true/>
 	<key>com.apple.security.network.client</key>
 	<true/>
+	<!--
+		声明 app 的钥匙串 access group。
+		没有这一项，sandboxed app 首次访问 keychain 时 macOS 会弹「PCelechron
+		想要访问你的钥匙串中的密钥 'flutter_secure_storage_service'」要求用户
+		输入登录密码的对话框（截图那个），N 条记录 = N 个 prompt，体验极差。
+		加了之后，app 自己的 keychain item 落到 group.top.celechron.celechron，
+		首次授权一次后即静默。
+
+		`$(AppIdentifierPrefix)` 在有 Apple Developer 团队 ID 时解析为
+		`<TeamID>.`，ad-hoc 签名下解析为空；两种情况下 Xcode 都不报错，
+		CI 也不受影响。
+	-->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)group.top.celechron.celechron</string>
+	</array>
 </dict>
 </plist>
