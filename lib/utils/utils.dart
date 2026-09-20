@@ -34,6 +34,21 @@ const secureStorageIOSOptions = kDebugMode
         accountName: 'Celechron',
         groupId: 'group.top.celechron.celechron');
 
-const secureStorageMacOsOptions = MacOsOptions(
-  useDataProtectionKeyChain: false,
-);
+// macOS 必须显式传 groupId，Swift 端的 FlutterSecureStorage.swift 会把它写到
+// kSecAttrAccessGroup；少了它，item 落到 login keychain（不是 app 自己的 group），
+// macOS 每次启动都弹「PCelechron 想要访问你的钥匙串中的密钥 'flutter_secure_storage_service'」
+// 框要求用户输入登录密码。debug 后缀与 iOS 保持一致便于识别。
+// 注意：必须与 macos/Runner/Release.entitlements 的 keychain-access-groups 字符串
+// 一致（`group.top.celechron.celechron`），且对应 entitlement 必须存在，
+// 否则 SecItemAdd 返回 errSecMissingEntitlement。
+const secureStorageMacOsOptions = kDebugMode
+    ? MacOsOptions(
+        groupId: 'group.top.celechron.celechron.debug',
+        accountName: 'Celechron',
+        useDataProtectionKeyChain: false,
+      )
+    : MacOsOptions(
+        groupId: 'group.top.celechron.celechron',
+        accountName: 'Celechron',
+        useDataProtectionKeyChain: false,
+      );
