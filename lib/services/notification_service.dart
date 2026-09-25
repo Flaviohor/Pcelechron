@@ -1,4 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:window_manager/window_manager.dart';
+
+import 'package:celechron/services/diagnostic_log_service.dart';
 
 /// 通知服务的统一入口。
 ///
@@ -34,13 +39,45 @@ class NotificationService {
       appUserModelId: windowsAppUserModelId,
       guid: windowsGuid,
     );
-    const settings = InitializationSettings(
+    final linuxSettings = LinuxInitializationSettings(
+      defaultActionName: '打开 PCelechron',
+      // AssetsLinuxIcon 按相对路径解析到 data/flutter_assets/ 下的资产文件，
+      // 与 pubspec.yaml 声明的 assets/ 目录一致。
+      defaultIcon: AssetsLinuxIcon('assets/logo.png'),
+    );
+    final settings = InitializationSettings(
       iOS: darwinSettings,
       macOS: darwinSettings,
       windows: windowsSettings,
+      linux: linuxSettings,
     );
-    await plugin.initialize(settings: settings);
+    await plugin.initialize(
+      settings: settings,
+      // 点击通知把主窗口带回前台：托盘驻留时窗口多半是隐藏的，
+      // 用户从系统通知进入应用必须先还原窗口。
+      onDidReceiveNotificationResponse: _onNotificationTap,
+    );
     _initialized = true;
+  }
+
+  static void _onNotificationTap(NotificationResponse response) {
+    unawaited(_restoreMainWindow());
+  }
+
+  static Future<void> _restoreMainWindow() async {
+    try {
+      await windowManager.show();
+      await windowManager.focus();
+    } on Object catch (error, stackTrace) {
+      DiagnosticLogService.instance.record(
+        level: CelechronLogLevel.warning,
+        module: 'notification',
+        operation: 'tap',
+        message: '点击通知后还原主窗口失败',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
   }
 
   /// 发一条通知。
@@ -74,6 +111,16 @@ class NotificationService {
   /// 请求通知权限。Android 13+ 需要显式授权，Windows / iOS 已在 init 中处理。
   static Future<void> requestPermission() async {
     await ensureInitialized();
+  }
+
+  /// 设置页「发送测试通知」：让用户当场验证系统通知链路是否畅通。
+  static Future<void> showTestNotification() {
+    return show(
+      id: 1,
+      title: 'PCelechron 通知测试',
+      body: '能看到这条通知，说明系统通知已正常工作。成绩变动与作业截止提醒都会走同一条链路。',
+      details: gradeChangeDetails,
+    );
   }
 
   /// 成绩变动提醒通道

@@ -29,7 +29,9 @@ dependencies:
   crypto: 
   path_provider:
   share_plus: ^12.0.1 # 9fb0fb 提交当中提升了版本
-
+  window_manager: ^0.5.2
+  system_tray: ^2.0.3
+  file_selector: ^1.1.0
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -53,6 +55,7 @@ flutter:
 
   assets:
     - assets/
+    - assets/calendar/
 
   # To add assets to your application, add an assets section, like this:
   # assets:

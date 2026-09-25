@@ -34,6 +34,9 @@ class Option {
   RxBool hideHomeGpa;
   RxBool asyncRefresh;
 
+  /// 桌面端：关闭窗口时隐藏到托盘而不是退出进程（后台刷新与通知依赖进程存活）。
+  RxBool closeToTray;
+
   Option({
     required this.workTime,
     required this.restTime,
@@ -45,5 +48,6 @@ class Option {
     required this.courseIdMappingList,
     required this.hideHomeGpa,
     required this.asyncRefresh,
+    required this.closeToTray,
   });
 }

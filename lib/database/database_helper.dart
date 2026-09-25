@@ -58,6 +58,7 @@ class DatabaseHelper {
   final String kCourseIdMappingList = 'courseIdMappingList';
   final String kHideHomeGpa = 'hideHomeGpa';
   final String kAsyncRefresh = 'asyncRefresh';
+  final String kCloseToTray = 'closeToTray';
 
   Option getOption() {
     return Option(
@@ -71,6 +72,7 @@ class DatabaseHelper {
       courseIdMappingList: getCourseIdMappingList().obs,
       hideHomeGpa: getHideHomeGpa().obs,
       asyncRefresh: getAsyncRefresh().obs,
+      closeToTray: getCloseToTray().obs,
     );
   }
 
@@ -175,6 +177,19 @@ class DatabaseHelper {
 
   Future<void> setAsyncRefresh(bool asyncRefresh) async {
     await optionsBox.put(kAsyncRefresh, asyncRefresh);
+  }
+
+  /// 关窗最小化到托盘：默认开启。后台刷新定时器跑在主进程内，
+  /// 关窗即退出会让成绩推送 / DDL 提醒失效，所以默认驻留托盘。
+  bool getCloseToTray() {
+    if (optionsBox.get(kCloseToTray) == null) {
+      optionsBox.put(kCloseToTray, true);
+    }
+    return optionsBox.get(kCloseToTray);
+  }
+
+  Future<void> setCloseToTray(bool closeToTray) async {
+    await optionsBox.put(kCloseToTray, closeToTray);
   }
 
   List<CourseIdMap> getCourseIdMappingList() {

@@ -17,7 +17,10 @@ import 'package:celechron/services/refresh_coordinator.dart';
 import 'package:celechron/worker/ecard_widget_messenger.dart';
 import 'package:celechron/database/database_helper.dart';
 import 'package:celechron/database/hive_paths.dart';
+import 'package:celechron/services/desktop_tray_service.dart';
 import 'package:celechron/utils/global.dart';
+import 'package:celechron/utils/platform_features.dart';
+import 'package:window_manager/window_manager.dart';
 
 /// 应用级内嵌字体族名，与 pubspec.yaml 的 fonts 段保持一致。
 const String kAppFontFamily = 'NotoSansSC';
@@ -57,6 +60,11 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   ECardWidgetMessenger.installNativeHandler();
 
+  // 桌面端窗口管理提前初始化：托盘常驻（关窗隐藏而非退出）依赖它拦截关闭事件。
+  if (PlatformFeatures.isDesktop) {
+    await windowManager.ensureInitialized();
+  }
+
   // 尽可能早地声明前台活跃，Workmanager isolate 会据此安全让行。
   await RefreshCoordinator.setForegroundActive(true);
 
@@ -83,6 +91,9 @@ void main() async {
   Get.put(db.getFlowListUpdateTime().obs, tag: 'flowListLastUpdate');
   Get.put(db.getOption(), tag: 'option');
   Get.put(db.getFuse().obs, tag: 'fuse');
+
+  // 托盘常驻依赖「关窗驻留」选项，因此放在 Option 注册之后启动。
+  await DesktopTrayService.instance.start();
 
   runApp(const CelechronApp());
 
@@ -214,7 +225,8 @@ class _CelechronAppState extends State<CelechronApp>
             return DefaultTextStyle.merge(
               style: base.copyWith(fontFamily: kAppFontFamily),
               child: MediaQuery(
-                data: MediaQuery.of(context).copyWith(alwaysUse24HourFormat: true),
+                data: MediaQuery.of(context)
+                    .copyWith(alwaysUse24HourFormat: true),
                 child: child!,
               ),
             );
