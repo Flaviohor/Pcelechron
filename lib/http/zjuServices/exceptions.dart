@@ -111,6 +111,17 @@ class CachedDataException extends ExceptionWithMessage {
       );
 }
 
+/// 教务网限流（非标准状态码 921）：请求过于密集被服务端拒绝。
+/// 属瞬态错误，上层（_fetchWithRetry）应等待后重发，而不是当作普通失败。
+class RateLimitedException extends ExceptionWithMessage {
+  RateLimitedException(
+    super.message, {
+    super.details,
+    super.originalError,
+    super.stackTrace,
+  });
+}
+
 Exception requestTimeout([String message = '请求超时']) {
   return TimeoutException(message);
 }

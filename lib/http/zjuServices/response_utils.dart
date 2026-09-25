@@ -175,6 +175,13 @@ void validateResponse({
       details: debugDetails,
     );
   }
+  if (status == 921) {
+    // 教务网的非标准限流状态码：请求过密时返回，等待后重发即可（上游 #181）。
+    throw RateLimitedException(
+      '$context：请求过于频繁，被教务网限流（HTTP 921）',
+      details: debugDetails,
+    );
+  }
   if (status < 200 || status >= 300) {
     throw ExceptionWithMessage(
       '$context：请求失败',

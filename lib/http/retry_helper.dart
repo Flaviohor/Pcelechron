@@ -11,6 +11,9 @@ const _commonRetryableMessages = <String>[
   "socketexception",
   "无法获取session",
   "会话已过期",
+  // 教务网非标准状态码 921：请求过于密集被限流，等待后重发即可（上游 #181）
+  "921",
+  "限流",
 ];
 
 bool shouldRetryAfterLogin(

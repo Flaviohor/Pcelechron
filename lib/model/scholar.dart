@@ -467,7 +467,33 @@ class Scholar {
       majorGpaAndCredit = tempMajorGpaAndCredit;
     }
     if (errorResult[2] == false && tempSemesters.isNotEmpty) {
-      semesters = tempSemesters;
+      // 按学期合并：正常学期以新抓取为准（退课等变动才能生效）；
+      // 但抓取结果为空的学期不得清空已有课程安排——教务网偶发对某些学期
+      // 返回 null / 空课表（上游 #174 选课期清空课表），此时保留旧数据。
+      final merged = <Semester>[];
+      for (final incoming in tempSemesters) {
+        final existingIndex =
+            semesters.indexWhere((semester) => semester.name == incoming.name);
+        if (existingIndex < 0) {
+          merged.add(incoming);
+        } else if (incoming.sessions.isEmpty &&
+            semesters[existingIndex].sessions.isNotEmpty) {
+          // 课表抓空：保留旧学期对象，仅合并成绩/考试等仍有的新数据。
+          final existing = semesters[existingIndex];
+          existing.mergePartialFrom(incoming);
+          merged.add(existing);
+        } else {
+          merged.add(incoming);
+        }
+      }
+      // 新抓取没覆盖到的学年（如探测学年失败）也保留，避免无谓丢数据。
+      for (final existing in semesters) {
+        if (!merged.any((semester) => semester.name == existing.name)) {
+          merged.add(existing);
+        }
+      }
+      merged.sort((a, b) => b.name.compareTo(a.name));
+      semesters = merged;
     } else if (tempSemesters.isNotEmpty) {
       // 降级刷新只合并可用片段，避免不完整新对象覆盖已有课表明细。
       for (final incoming in tempSemesters) {
@@ -481,8 +507,17 @@ class Scholar {
       }
       semesters.sort((a, b) => b.name.compareTo(a.name));
     }
-    if (errorResult[3] == false) {
+    // 作业模块没有报错但返回空列表时（学在浙大偶发异常），不覆盖已有作业；
+    // 全新用户（原本就没有作业）不受影响。
+    if (errorResult[3] == false && (tempTodos.isNotEmpty || todos.isEmpty)) {
       todos = tempTodos;
+    } else if (errorResult[3] == false && tempTodos.isEmpty) {
+      DiagnosticLogService.instance.record(
+        level: CelechronLogLevel.warning,
+        module: '刷新聚合',
+        operation: 'emptyDataGuard',
+        message: '作业模块成功但返回空列表，已保留原有 ${todos.length} 条作业',
+      );
     }
     if (tempPracticeSnapshot != null) {
       // 详情仍只采用 getSqjl；汇总独立采用 getMyInfo 的三级回退结果。

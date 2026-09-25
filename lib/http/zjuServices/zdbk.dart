@@ -27,6 +27,29 @@ class Zdbk {
   int _activeSiteRequests = 0;
   final List<Completer<void>> _siteWaiters = [];
 
+  /// 教务网对零间隔连发的课表请求会返回非标准状态码 921 限流（上游 #181）。
+  /// 实测距上一次课表请求完成后 ≥0.9s 再发起即可全部成功，取 1s 留出裕量。
+  /// 调用方已把课表请求串成单链，这里只做「完成后间隔」节流，不做并发排队。
+  static const Duration _timetableRequestInterval = Duration(seconds: 1);
+  DateTime? _lastTimetableCompletedAt;
+
+  /// 距上一次课表请求完成不足间隔时，先等满再发。
+  Future<void> _paceTimetableRequest() async {
+    final lastCompletedAt = _lastTimetableCompletedAt;
+    if (lastCompletedAt == null) return;
+    final wait = lastCompletedAt
+        .add(_timetableRequestInterval)
+        .difference(DateTime.now());
+    if (wait <= Duration.zero) return;
+    DiagnosticLogService.instance.record(
+      module: '教务网课表',
+      operation: 'throttleWait',
+      message: '等待教务网限流间隔',
+      durationMs: wait.inMilliseconds,
+    );
+    await Future<void>.delayed(wait);
+  }
+
   set db(DatabaseHelper? db) {
     _db = db;
   }
@@ -479,94 +502,100 @@ class Zdbk {
 
   Future<Tuple<Exception?, Iterable<Session>>> getTimetable(
       HttpClient httpClient, String year, String semester) async {
-    return await _withAutoRelogin(httpClient, (relogged, retried) async {
-      late HttpClientRequest request;
-      late HttpClientResponse response;
-      final uri =
-          Uri.parse("https://zdbk.zju.edu.cn/jwglxt/kbcx/xskbcx_cxXsKb.html");
+    await _paceTimetableRequest();
+    try {
+      return await _withAutoRelogin(httpClient, (relogged, retried) async {
+        late HttpClientRequest request;
+        late HttpClientResponse response;
+        final uri =
+            Uri.parse("https://zdbk.zju.edu.cn/jwglxt/kbcx/xskbcx_cxXsKb.html");
 
-      try {
-        for (var i = 0; i < 3; i++) {
-          request = await httpClient.postUrl(uri).timeout(
-              const Duration(seconds: 8),
-              onTimeout: () => throw requestTimeout());
-          request.headers
-            ..add("Referer",
-                "https://zdbk.zju.edu.cn/jwglxt/xtgl/index_initMenu.html")
-            ..set('Connection', 'close')
-            ..add('User-Agent',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
-            ..add('Accept', 'application/json, text/javascript, */*; q=0.01')
-            ..add('X-Requested-With', 'XMLHttpRequest');
-          request.cookies.add(_jSessionId!);
-          request.cookies.add(_route!);
-          request.followRedirects = false;
-          request.headers.contentType = ContentType(
-              'application', 'x-www-form-urlencoded',
-              charset: 'utf-8');
-          request.add(
-              utf8.encode('xnm=$year&xqm=$semester&captcha_value=$_captcha'));
-          response = await request.close().timeout(const Duration(seconds: 8),
-              onTimeout: () => throw requestTimeout());
+        try {
+          for (var i = 0; i < 3; i++) {
+            request = await httpClient.postUrl(uri).timeout(
+                const Duration(seconds: 8),
+                onTimeout: () => throw requestTimeout());
+            request.headers
+              ..add("Referer",
+                  "https://zdbk.zju.edu.cn/jwglxt/xtgl/index_initMenu.html")
+              ..set('Connection', 'close')
+              ..add('User-Agent',
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
+              ..add('Accept', 'application/json, text/javascript, */*; q=0.01')
+              ..add('X-Requested-With', 'XMLHttpRequest');
+            request.cookies.add(_jSessionId!);
+            request.cookies.add(_route!);
+            request.followRedirects = false;
+            request.headers.contentType = ContentType(
+                'application', 'x-www-form-urlencoded',
+                charset: 'utf-8');
+            request.add(
+                utf8.encode('xnm=$year&xqm=$semester&captcha_value=$_captcha'));
+            response = await request.close().timeout(const Duration(seconds: 8),
+                onTimeout: () => throw requestTimeout());
 
-          var responseText =
-              await readResponseBody(response, context: '教务网课表接口');
+            var responseText =
+                await readResponseBody(response, context: '教务网课表接口');
+            final context = '教务网课表接口（学年 $year，学期 $semester，请求类型 课表）';
+            _validateResponse(response, responseText,
+                context: context,
+                requestUri: uri,
+                relogged: relogged,
+                retried: retried);
+
+            if (responseText.contains("captcha_error")) {
+              _captcha = null;
+              if (GlobalStatus.isFirstScreenReq) {
+                throw ExceptionWithMessage("需要验证码");
+              }
+              var imageBytes = await getCaptcha(httpClient);
+              var captcha = await ImageCodePortal.show(
+                  imageBytes: imageBytes,
+                  onRefresh: () async {
+                    return await getCaptcha(httpClient);
+                  });
+              if (captcha == null) {
+                throw ExceptionWithMessage("验证码未填写");
+              }
+              _captcha = captcha.trim();
+              continue;
+            }
+
+            if (responseText.trim() == "null") return Tuple(null, <Session>[]);
+            final payload = decodeJsonMap(responseText,
+                context: '$context；HTTP ${response.statusCode}');
+            final items = asDynamicList(payload['kbList']);
+            if (items == null) {
+              throw ExceptionWithMessage(
+                  '$context：缺少 kbList 数组；HTTP ${response.statusCode}'
+                  '；响应摘要：${responseSummary(responseText)}');
+            }
+            final sessions = _parseSessions(items, context);
+            _writeCache('zdbk_Timetable$year$semester', jsonEncode(items));
+            return Tuple(null, sessions);
+          }
+          throw ExceptionWithMessage("验证码识别失败");
+        } on Object catch (error, stackTrace) {
+          if (error is AuthenticationExpiredException) rethrow;
           final context = '教务网课表接口（学年 $year，学期 $semester，请求类型 课表）';
-          _validateResponse(response, responseText,
+          final exception = exceptionFrom(error,
               context: context,
               requestUri: uri,
               relogged: relogged,
-              retried: retried);
-
-          if (responseText.contains("captcha_error")) {
-            _captcha = null;
-            if (GlobalStatus.isFirstScreenReq) {
-              throw ExceptionWithMessage("需要验证码");
-            }
-            var imageBytes = await getCaptcha(httpClient);
-            var captcha = await ImageCodePortal.show(
-                imageBytes: imageBytes,
-                onRefresh: () async {
-                  return await getCaptcha(httpClient);
-                });
-            if (captcha == null) {
-              throw ExceptionWithMessage("验证码未填写");
-            }
-            _captcha = captcha.trim();
-            continue;
-          }
-
-          if (responseText.trim() == "null") return Tuple(null, <Session>[]);
-          final payload = decodeJsonMap(responseText,
-              context: '$context；HTTP ${response.statusCode}');
-          final items = asDynamicList(payload['kbList']);
-          if (items == null) {
-            throw ExceptionWithMessage(
-                '$context：缺少 kbList 数组；HTTP ${response.statusCode}'
-                '；响应摘要：${responseSummary(responseText)}');
-          }
-          final sessions = _parseSessions(items, context);
-          _writeCache('zdbk_Timetable$year$semester', jsonEncode(items));
-          return Tuple(null, sessions);
+              retried: retried,
+              stackTrace: stackTrace);
+          final cached =
+              _cachedList('zdbk_Timetable$year$semester', '$context 缓存');
+          return Tuple(
+            _cacheAwareException(exception, cached, context),
+            _parseSessions(cached.data, '$context 缓存'),
+          );
         }
-        throw ExceptionWithMessage("验证码识别失败");
-      } on Object catch (error, stackTrace) {
-        if (error is AuthenticationExpiredException) rethrow;
-        final context = '教务网课表接口（学年 $year，学期 $semester，请求类型 课表）';
-        final exception = exceptionFrom(error,
-            context: context,
-            requestUri: uri,
-            relogged: relogged,
-            retried: retried,
-            stackTrace: stackTrace);
-        final cached =
-            _cachedList('zdbk_Timetable$year$semester', '$context 缓存');
-        return Tuple(
-          _cacheAwareException(exception, cached, context),
-          _parseSessions(cached.data, '$context 缓存'),
-        );
-      }
-    });
+      });
+    } finally {
+      // 无论成功、抛异常还是走缓存降级，都记录完成时间，作为下一次节流的基准。
+      _lastTimetableCompletedAt = DateTime.now();
+    }
   }
 
   Future<Tuple<Exception?, Iterable<ExamDto>>> getExamsDto(
