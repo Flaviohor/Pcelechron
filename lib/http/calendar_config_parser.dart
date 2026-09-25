@@ -6,6 +6,14 @@ import 'package:flutter/foundation.dart';
 
 const calendarConfigBaseUrl = 'http://calendar.celechron.top/';
 
+/// 校历配置数据源，按顺序回退（参考 Elychron 的多级校历回退）。
+///
+/// 第一项是上游官方 OSS；社区镜像仓库出现后，往列表里追加 URL 即可生效，
+/// 抓取逻辑会自动逐源尝试，无需改动 TimeConfigService。
+const List<String> calendarConfigBaseUrls = [
+  calendarConfigBaseUrl,
+];
+
 /// 返回日期所属学年的起始年份；九月是学年边界，不代表课表开放时间。
 int academicYearStartFor(DateTime now) =>
     now.month >= DateTime.september ? now.year : now.year - 1;
@@ -99,6 +107,14 @@ String calendarObjectKeyForSemester(String semesterId) {
 Uri calendarConfigUriForSemester(String semesterId) {
   final key = calendarObjectKeyForSemester(semesterId);
   return Uri.parse(calendarConfigBaseUrl).resolve(key);
+}
+
+/// 各数据源下该学期的配置 URL，顺序与 [calendarConfigBaseUrls] 一致。
+List<Uri> calendarConfigUrisForSemester(String semesterId) {
+  final key = calendarObjectKeyForSemester(semesterId);
+  return calendarConfigBaseUrls
+      .map((base) => Uri.parse(base).resolve(key))
+      .toList();
 }
 
 Map<String, dynamic> decodeAndValidateCalendarConfig(

@@ -372,6 +372,7 @@ class UgrsSpider implements Spider {
     var calendarLive = 0;
     var calendarCache = 0;
     var calendarFallback = 0;
+    var calendarBundled = 0;
     var calendarUnpublished = 0;
     var timetableFetches = <Future<String?>>[];
     var cancelTimetableFetch = false;
@@ -408,6 +409,8 @@ class UgrsSpider implements Spider {
             switch (value.item3) {
               case DataSourceStatus.live:
                 calendarLive++;
+              case DataSourceStatus.bundled:
+                calendarBundled++;
               case DataSourceStatus.cache:
                 calendarCache++;
               case DataSourceStatus.fallback:
@@ -470,6 +473,8 @@ class UgrsSpider implements Spider {
             switch (value.item3) {
               case DataSourceStatus.live:
                 calendarLive++;
+              case DataSourceStatus.bundled:
+                calendarBundled++;
               case DataSourceStatus.cache:
                 calendarCache++;
               case DataSourceStatus.fallback:
@@ -671,8 +676,9 @@ class UgrsSpider implements Spider {
       if (failure != null) return failure;
       if (calendarCache > 0 || calendarFallback > 0) {
         return degradedRefreshText(
-          '校历：$calendarLive 个远程成功，$calendarCache 个缓存降级，'
-          '$calendarFallback 个默认配置'
+          '校历：$calendarLive 个远程成功'
+          '${calendarBundled > 0 ? '，$calendarBundled 个随包内置' : ''}'
+          '，$calendarCache 个缓存降级，$calendarFallback 个默认配置'
           '${calendarUnpublished > 0 ? '，$calendarUnpublished 个未发布（未来学期）' : ''}',
         );
       }
@@ -837,8 +843,8 @@ class UgrsSpider implements Spider {
       _lastUpdateTime = DateTime.now();
     }
     final calendarSuccessSummary = calendarUnpublished > 0
-        ? '$calendarLive 个远程成功，$calendarUnpublished 个未发布'
-        : '$calendarLive 个远程成功';
+        ? '$calendarLive 个远程成功${calendarBundled > 0 ? '，$calendarBundled 个随包内置' : ''}，$calendarUnpublished 个未发布'
+        : '$calendarLive 个远程成功${calendarBundled > 0 ? '，$calendarBundled 个随包内置' : ''}';
     for (var i = 0; i < fetchErrorMessages.length; i++) {
       if (fetchErrorMessages[i] != null) {
         final message = fetchErrorMessages[i]!;
