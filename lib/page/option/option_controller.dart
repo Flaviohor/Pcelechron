@@ -5,11 +5,15 @@ import 'package:flutter/cupertino.dart';
 
 import 'package:celechron/model/scholar.dart';
 import 'package:celechron/model/option.dart';
+import 'package:celechron/model/task.dart';
 import 'package:celechron/database/database_helper.dart';
+import 'package:celechron/services/notification_service.dart';
+import 'package:celechron/services/task_import_export_service.dart';
 import 'package:celechron/worker/ecard_widget_messenger.dart';
 import 'package:celechron/worker/fuse.dart';
 import 'package:celechron/worker/background_refresh.dart';
 import 'package:celechron/model/calendar_to_ical.dart';
+import 'package:celechron/page/flow/flow_controller.dart';
 
 import 'package:celechron/utils/utils.dart';
 
@@ -120,6 +124,67 @@ class OptionController extends GetxController {
   set asyncRefresh(bool value) {
     _option.asyncRefresh.value = value;
     _db.setAsyncRefresh(value);
+  }
+
+  bool get closeToTray => _option.closeToTray.value;
+
+  set closeToTray(bool value) {
+    _option.closeToTray.value = value;
+    _db.setCloseToTray(value);
+  }
+
+  /// 设置页「发送测试通知」：当场验证系统通知链路。
+  Future<void> sendTestNotification() {
+    return NotificationService.showTestNotification();
+  }
+
+  // ===== 待办数据导入导出 =====
+
+  RxList<Task> get _taskList => Get.find<RxList<Task>>(tag: 'taskList');
+
+  /// 导出全部任务为 JSON。返回导出条数；用户取消返回 null。
+  Future<int?> exportTasksJson() {
+    return TaskImportExportService.exportTasksJson(_taskList.toList());
+  }
+
+  /// 导入 JSON 备份并按 uid 合并。返回结果摘要；取消/解析失败返回 null。
+  Future<String?> importTasksJson() async {
+    final result =
+        await TaskImportExportService.importTasksJson(_taskList.toList());
+    if (result == null) return null;
+    if (result.added.isNotEmpty) _taskList.addAll(result.added);
+    // 备份侧删除的条目在合并时已被标记为 deleted，这里直接移除。
+    _taskList.removeWhere((t) => t.status == TaskStatus.deleted);
+    _taskList.sort((a, b) => a.endTime.compareTo(b.endTime));
+    await persistTaskList(_taskList);
+    _regenerateFlowList();
+    return result.summary;
+  }
+
+  /// 导入 iCal 日历为「日程」。返回结果摘要；取消/无可导入事件返回 null。
+  Future<String?> importIcal() async {
+    final result = await TaskImportExportService.importIcal(_taskList.toList());
+    if (result == null) return null;
+    final (added, skipped) = result;
+    if (added.isNotEmpty) _taskList.addAll(added);
+    _taskList.sort((a, b) => a.endTime.compareTo(b.endTime));
+    await persistTaskList(_taskList);
+    _regenerateFlowList();
+    return '新增 ${added.length} 条日程'
+        '${skipped > 0 ? '，按 UID 去重跳过 $skipped 条' : ''}';
+  }
+
+  /// 新增/删除日程会影响自动规划，导入完成后重排一次。
+  void _regenerateFlowList() {
+    try {
+      final flow = Get.find<FlowController>();
+      flow.removeFlowInFlowList();
+      final now = DateTime.now();
+      flow.generateNewFlowList(
+          DateTime(now.year, now.month, now.day, now.hour, now.minute));
+    } on Object {
+      // 规划器尚未就绪时跳过，下次刷新任务页时会自动重排。
+    }
   }
 
   String get celechronVersion => _fuse.value.displayVersion;
