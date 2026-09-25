@@ -15,6 +15,7 @@ import 'package:celechron/design/round_rectangle_card.dart';
 import 'package:celechron/design/custom_colors.dart';
 import 'package:celechron/page/scholar/course_detail/course_detail_view.dart';
 import 'package:celechron/page/calendar/schedule_view.dart';
+import 'package:celechron/page/calendar/week_view.dart';
 import 'package:celechron/utils/platform_features.dart';
 import 'calendar_controller.dart';
 
@@ -38,9 +39,9 @@ class CalendarPage extends StatelessWidget {
             Obx(
               () => SubtitleRow(
                 subtitle: _calendarController.viewMode.value ==
-                        CalendarViewMode.calendar
-                    ? '${_calendarController.focusedDay.value.year} 年 ${_calendarController.focusedDay.value.month} 月'
-                    : _calendarController.getCurrentSemesterDisplayName(),
+                        CalendarViewMode.schedule
+                    ? _calendarController.getCurrentSemesterDisplayName()
+                    : '${_calendarController.focusedDay.value.year} 年 ${_calendarController.focusedDay.value.month} 月',
                 right: Row(
                   children: [
                     if (_calendarController.viewMode.value ==
@@ -83,10 +84,12 @@ class CalendarPage extends StatelessWidget {
                     CupertinoButton(
                       padding: EdgeInsets.zero,
                       child: Icon(
-                        _calendarController.viewMode.value ==
-                                CalendarViewMode.calendar
-                            ? CupertinoIcons.calendar
-                            : CupertinoIcons.list_bullet,
+                        switch (_calendarController.viewMode.value) {
+                          CalendarViewMode.calendar =>
+                            CupertinoIcons.calendar_today,
+                          CalendarViewMode.week => CupertinoIcons.list_bullet,
+                          CalendarViewMode.schedule => CupertinoIcons.calendar,
+                        },
                         semanticLabel: '切换视图',
                       ),
                       onPressed: () {
@@ -101,9 +104,21 @@ class CalendarPage extends StatelessWidget {
             Expanded(
               child: Obx(
                 () {
-                  if (_calendarController.viewMode.value ==
-                      CalendarViewMode.schedule) {
-                    return ScheduleView(controller: _calendarController);
+                  switch (_calendarController.viewMode.value) {
+                    case CalendarViewMode.week:
+                      return WeekView(
+                        controller: _calendarController,
+                        onPeriodTap: handlePeriodTap,
+                        onEmptyTap: (time) async {
+                          await newDeadline(context, time: time);
+                          _taskController.updateDeadlineList();
+                          _taskController.taskList.refresh();
+                        },
+                      );
+                    case CalendarViewMode.schedule:
+                      return ScheduleView(controller: _calendarController);
+                    case CalendarViewMode.calendar:
+                      break;
                   }
                   return Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -355,28 +370,31 @@ class CalendarPage extends StatelessWidget {
     );
   }
 
+  /// 事件块的统一点击行为：课程/考试跳课程详情，日程弹编辑对话框。
+  /// 日视图卡片与周视图事件块共用。
+  void handlePeriodTap(BuildContext context, Period period) {
+    if (period.type == PeriodType.classes || period.type == PeriodType.test) {
+      Navigator.of(context, rootNavigator: true).push(
+        CupertinoPageRoute(
+            builder: (context) => CourseDetailPage(courseId: period.fromUid)),
+      );
+    } else if (period.type == PeriodType.user) {
+      Task? deadline;
+      for (var x in deadlineList) {
+        if (x.uid == period.fromUid) {
+          deadline = x;
+          break;
+        }
+      }
+      if (deadline != null) {
+        showCardDialog(context, deadline);
+      }
+    }
+  }
+
   Widget createCard(context, Period period) {
     return RoundRectangleCard(
-      onTap:
-          (period.type == PeriodType.classes || period.type == PeriodType.test)
-              ? () async => Navigator.of(context, rootNavigator: true).push(
-                  CupertinoPageRoute(
-                      builder: (context) =>
-                          CourseDetailPage(courseId: period.fromUid)))
-              : (period.type == PeriodType.user
-                  ? (() async {
-                      Task? deadline;
-                      for (var x in deadlineList) {
-                        if (x.uid == period.fromUid) {
-                          deadline = x;
-                          break;
-                        }
-                      }
-                      if (deadline != null) {
-                        showCardDialog(context, deadline);
-                      }
-                    })
-                  : null),
+      onTap: () => handlePeriodTap(context, period),
       child: Padding(
         padding: const EdgeInsets.only(left: 8, right: 8),
         child: Row(

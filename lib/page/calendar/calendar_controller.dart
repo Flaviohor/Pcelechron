@@ -8,6 +8,7 @@ import 'package:celechron/model/semester.dart';
 
 enum CalendarViewMode {
   calendar,
+  week,
   schedule,
 }
 
@@ -84,10 +85,15 @@ class CalendarController extends GetxController {
     return eventsOfDay;
   }
 
+  /// 月历 → 周视图 → 列表 三态轮换。
   void toggleViewMode() {
-    viewMode.value = viewMode.value == CalendarViewMode.calendar
-        ? CalendarViewMode.schedule
-        : CalendarViewMode.calendar;
+    const order = [
+      CalendarViewMode.calendar,
+      CalendarViewMode.week,
+      CalendarViewMode.schedule,
+    ];
+    final next = (order.indexOf(viewMode.value) + 1) % order.length;
+    viewMode.value = order[next];
   }
 
   Semester? getCurrentSemester() {
