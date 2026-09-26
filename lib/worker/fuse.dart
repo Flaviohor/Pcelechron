@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:get/get.dart';
 
 import 'package:celechron/database/database_helper.dart';
+import 'package:celechron/utils/global.dart';
 
 class Fuse {
   late DateTime lastUpdateTime;
@@ -17,7 +18,9 @@ class Fuse {
   final HttpClient _httpClient = HttpClient();
   final DatabaseHelper _db = Get.find<DatabaseHelper>(tag: 'db');
 
-  String get displayVersion => 'PC-1.3.3';
+  /// 显示版本从 PackageInfo 动态加载（main 启动时写入 appDisplayVersion），
+  /// 跟随 pubspec.yaml 的 version，不再需要发版时手动改这里。
+  String get displayVersion => appDisplayVersion;
 
   Fuse() {
     lastUpdateTime = DateTime(2001, 1, 1);
@@ -31,8 +34,7 @@ class Fuse {
       }
 
       late String checkUpdateUrl;
-      checkUpdateUrl =
-          "https://api.celechron.top/checkUpdate?platform=others";
+      checkUpdateUrl = "https://api.celechron.top/checkUpdate?platform=others";
 
       var request = await _httpClient
           .getUrl(Uri.parse(checkUpdateUrl))

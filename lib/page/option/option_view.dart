@@ -17,6 +17,8 @@ import 'package:get/get.dart';
 import 'custom_license_page.dart';
 import 'login_page.dart';
 import 'option_controller.dart';
+import 'update_sheet.dart';
+import 'package:celechron/services/app_update_service.dart';
 
 const Color _kHeaderFooterColor = CupertinoDynamicColor(
   color: Color.fromRGBO(108, 108, 108, 1.0),
@@ -32,6 +34,7 @@ const Color _kHeaderFooterColor = CupertinoDynamicColor(
 class OptionPage extends StatelessWidget {
   final _optionController =
       Get.put(OptionController(), tag: 'optionController');
+  final _updateController = Get.put(AppUpdateController(), tag: 'appUpdate');
 
   OptionPage({super.key});
 
@@ -543,6 +546,13 @@ class OptionPage extends StatelessWidget {
                   children: <CupertinoListTile>[
                     CupertinoListTile(
                       backgroundColor: const Color(0x00000000),
+                      title: const Text('检查更新'),
+                      subtitle: Obx(() => Text(_updateController.subtitleText)),
+                      trailing: const BackChervonRow(),
+                      onTap: () => _showUpdateSheet(context),
+                    ),
+                    CupertinoListTile(
+                      backgroundColor: const Color(0x00000000),
                       title: const Text('关于 PCelechron'),
                       trailing: BackChervonRow(
                         child: Text(_optionController.celechronVersion,
@@ -632,6 +642,13 @@ class OptionPage extends StatelessWidget {
             ],
           );
         });
+  }
+
+  void _showUpdateSheet(BuildContext context) {
+    showCupertinoModalPopup<void>(
+      context: context,
+      builder: (_) => const UpdateSheet(),
+    );
   }
 
   void _showBrightnessPicker(BuildContext context) {

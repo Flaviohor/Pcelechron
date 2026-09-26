@@ -17,9 +17,11 @@ import 'package:celechron/services/refresh_coordinator.dart';
 import 'package:celechron/worker/ecard_widget_messenger.dart';
 import 'package:celechron/database/database_helper.dart';
 import 'package:celechron/database/hive_paths.dart';
+import 'package:celechron/services/app_update_service.dart';
 import 'package:celechron/services/desktop_tray_service.dart';
 import 'package:celechron/utils/global.dart';
 import 'package:celechron/utils/platform_features.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:window_manager/window_manager.dart';
 
 /// 应用级内嵌字体族名，与 pubspec.yaml 的 fonts 段保持一致。
@@ -60,6 +62,15 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   ECardWidgetMessenger.installNativeHandler();
 
+  // 应用显示版本（关于页 / 更新检查比对用）：从平台版本资源读取，
+  // 跟随 pubspec.yaml 的 version，不再有需要发版手动同步的硬编码。
+  try {
+    final info = await PackageInfo.fromPlatform();
+    appDisplayVersion = 'PC-${info.version}';
+  } on Object {
+    // 平台通道异常时退回兜底常量（utils/global.dart）。
+  }
+
   // 桌面端窗口管理提前初始化：托盘常驻（关窗隐藏而非退出）依赖它拦截关闭事件。
   if (PlatformFeatures.isDesktop) {
     await windowManager.ensureInitialized();
@@ -96,6 +107,10 @@ void main() async {
   await DesktopTrayService.instance.start();
 
   runApp(const CelechronApp());
+
+  // 启动时静默检查一次应用内更新；结果只在设置页「检查更新」入口上体现，
+  // 不弹窗打扰。
+  unawaited(Get.put(AppUpdateController(), tag: 'appUpdate').checkForUpdate());
 
   var scholar = Get.find<Rx<Scholar>>(tag: 'scholar');
   if (scholar.value.isLogan) {

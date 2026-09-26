@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:window_manager/window_manager.dart';
@@ -121,6 +122,67 @@ class NotificationService {
       body: '能看到这条通知，说明系统通知已正常工作。成绩变动与作业截止提醒都会走同一条链路。',
       details: gradeChangeDetails,
     );
+  }
+
+  // ===== 应用内更新的下载进度通知 =====
+
+  /// 下载进度通知的固定 id 与 Windows 进度条 id（更新同一 id 的通知不会
+  /// 反复弹横幅；Windows 上 updateProgressBar 是原地刷新）。
+  static const int downloadNotificationId = 9000;
+  static const String downloadProgressBarId = 'app-update-download';
+
+  /// 下载进度通知：Windows 带原生进度条（label 必须初始非空，后续才能更新）；
+  /// macOS 只发开始/完成两条横幅，进度看应用内对话框。
+  static NotificationDetails downloadProgressDetails({double? value}) {
+    return NotificationDetails(
+      macOS: const DarwinNotificationDetails(
+        presentBanner: true,
+        presentSound: false,
+        presentBadge: false,
+        presentList: true,
+      ),
+      windows: WindowsNotificationDetails(
+        progressBars: <WindowsProgressBar>[
+          WindowsProgressBar(
+            id: downloadProgressBarId,
+            status: '正在下载更新',
+            value: value,
+            // label 初始必须非空，后续 updateProgressBar 才能继续更新它。
+            label: value == null ? '准备中…' : '${(value * 100).round()}%',
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 原地刷新 Windows 下载通知的进度条；其他平台无此能力，静默跳过。
+  static Future<void> updateDownloadProgress(
+    double value, {
+    String? label,
+  }) async {
+    if (!Platform.isWindows) return;
+    try {
+      await plugin
+          .resolvePlatformSpecificImplementation<
+              FlutterLocalNotificationsWindows>()
+          ?.updateProgressBar(
+            notificationId: downloadNotificationId,
+            progressBar: WindowsProgressBar(
+              id: downloadProgressBarId,
+              status: '正在下载更新',
+              value: value.clamp(0.0, 1.0),
+              label: label,
+            ),
+          );
+    } on Object catch (error) {
+      // 进度条刷新失败不影响下载本身（如通知服务尚未就绪）。
+      DiagnosticLogService.instance.record(
+        module: 'notification',
+        operation: 'updateProgress',
+        message: '刷新下载进度通知失败',
+        error: error,
+      );
+    }
   }
 
   /// 成绩变动提醒通道
