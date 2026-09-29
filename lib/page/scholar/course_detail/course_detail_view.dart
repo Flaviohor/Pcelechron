@@ -11,6 +11,8 @@ import 'package:celechron/model/course.dart';
 import 'package:celechron/model/exam.dart';
 import 'package:celechron/model/session.dart';
 import 'package:celechron/model/scholar.dart';
+import 'package:celechron/services/diagnostic_log_service.dart';
+import 'package:celechron/http/zjuServices/classroom.dart';
 import 'package:celechron/model/task.dart';
 import 'package:celechron/utils/utils.dart';
 import 'package:flutter/services.dart' show Clipboard, ClipboardData;
@@ -558,62 +560,128 @@ class CourseDetailPage extends StatelessWidget {
     return a.contains(b) || b.contains(a);
   }
 
-  /// 智云课堂入口卡片。
+  /// 智云课堂入口卡片（直连版）。
   ///
-  /// 调研结论（2026-09）：自动匹配课程 → 回放页需要登录智云课堂后调
-  /// `https://classroom.zju.edu.cn/userapi/v1/infosimple` 拿 user_id/tenant_id，
-  /// 再调 `https://yjapi.cmc.zju.edu.cn/courseapi/v2/schedule/get-week-schedules`
-  /// 拉课表（见上游 issue #144）；但该站仅校园网/VPN 可达（本机与外部网络
-  /// 均无法直连验证），CAS 到 Bearer token 的换取链路未经抓包确认。
-  /// 因此 v1 采用「打开官网 + 自动复制课程名」的可靠方案，token 链路验证后
-  /// 可把这里升级为直接跳转对应课程页。
+  /// 登录链路与搜索接口经 celechron-tauri / zju-learning-assistant 两个开源
+  /// 实现交叉验证；SPA 课程页路由无公开先例，采用 `#/course/<id>` 直达——
+  /// hash 路由拼错只会落到官网默认页，且课程名始终先写入剪贴板兜底。
   Widget _buildClassroomSection(BuildContext context) {
     return Column(
       children: [
         SubSubtitleRow(subtitle: '课堂回放'),
-        RoundRectangleCard(
-          onTap: () async {
-            await Clipboard.setData(ClipboardData(text: course.name));
-            await launchUrlString('https://classroom.zju.edu.cn/',
-                mode: LaunchMode.externalApplication);
-          },
-          child: Padding(
-            padding: const EdgeInsets.only(left: 8, right: 8),
-            child: Row(
-              children: [
-                const Icon(CupertinoIcons.play_circle,
-                    size: 26, color: CupertinoColors.activeBlue),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('在智云课堂中查看「${course.name}」',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: CupertinoTheme.of(context)
-                              .textTheme
-                              .textStyle
-                              .copyWith(
-                                  fontSize: 15, fontWeight: FontWeight.w600)),
-                      Text('已复制课程名，打开后粘贴搜索即可（限校园网）',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: CupertinoDynamicColor.resolve(
-                                CupertinoColors.secondaryLabel, context),
-                          )),
-                    ],
-                  ),
-                ),
-                Icon(CupertinoIcons.chevron_right,
-                    size: 14,
-                    color: CupertinoDynamicColor.resolve(
-                        CupertinoColors.tertiaryLabel, context)),
-              ],
-            ),
-          ),
-        ),
+        _ClassroomDirectCard(course: course),
       ],
+    );
+  }
+}
+
+class _ClassroomDirectCard extends StatefulWidget {
+  const _ClassroomDirectCard({required this.course});
+
+  final Course course;
+
+  @override
+  State<_ClassroomDirectCard> createState() => _ClassroomDirectCardState();
+}
+
+class _ClassroomDirectCardState extends State<_ClassroomDirectCard> {
+  bool _loading = false;
+  String _status = '登录智云课堂并直达本课的直播与回放（需校园网）';
+
+  Future<void> _open() async {
+    if (_loading) return;
+    setState(() {
+      _loading = true;
+      _status = '正在登录智云课堂并匹配课程…';
+    });
+
+    // 课程名始终先进剪贴板：即使直达路由未命中，官网搜索一贴即中。
+    await Clipboard.setData(ClipboardData(text: widget.course.name));
+
+    Uri target = Uri.parse('https://classroom.zju.edu.cn/');
+    try {
+      final scholar = Get.find<Rx<Scholar>>(tag: 'scholar').value;
+      final matched = await ClassroomService.findCourse(
+        courseName: widget.course.name,
+        teacher: widget.course.teacher,
+        username: scholar.username,
+        password: scholar.password,
+      );
+      if (matched == null) {
+        _status = '未在智云课堂找到对应课程，已打开官网（课程名在剪贴板）';
+      } else {
+        target = Uri.parse(
+            'https://classroom.zju.edu.cn/#/course/${matched.courseId}');
+        _status = matched.realname.isEmpty
+            ? '已匹配「${matched.title}」，正在打开'
+            : '已匹配「${matched.title}」· ${matched.realname}，正在打开';
+      }
+    } on Object catch (error, stackTrace) {
+      DiagnosticLogService.instance.record(
+        level: CelechronLogLevel.warning,
+        module: 'classroom',
+        operation: 'direct',
+        message: '智云课堂直连失败，已回退到官网首页',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      _status = '连接智云课堂失败，已打开官网（课程名在剪贴板）';
+    }
+
+    await launchUrlString(target.toString(),
+        mode: LaunchMode.externalApplication);
+    if (mounted) {
+      setState(() {
+        _loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return RoundRectangleCard(
+      onTap: _loading ? null : _open,
+      child: Padding(
+        padding: const EdgeInsets.only(left: 8, right: 8),
+        child: Row(
+          children: [
+            const Icon(CupertinoIcons.play_circle,
+                size: 26, color: CupertinoColors.activeBlue),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('智云课堂 · ${widget.course.name}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: CupertinoTheme.of(context)
+                          .textTheme
+                          .textStyle
+                          .copyWith(fontSize: 15, fontWeight: FontWeight.w600)),
+                  Text(
+                    _status,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: CupertinoDynamicColor.resolve(
+                          CupertinoColors.secondaryLabel, context),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (_loading)
+              const CupertinoActivityIndicator(radius: 9)
+            else
+              Icon(CupertinoIcons.chevron_right,
+                  size: 14,
+                  color: CupertinoDynamicColor.resolve(
+                      CupertinoColors.tertiaryLabel, context)),
+          ],
+        ),
+      ),
     );
   }
 }
