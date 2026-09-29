@@ -6,9 +6,12 @@ import 'package:system_tray/system_tray.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'package:celechron/model/option.dart';
+import 'package:celechron/model/period.dart';
 import 'package:celechron/model/scholar.dart';
+import 'package:celechron/model/task.dart';
 import 'package:celechron/services/diagnostic_log_service.dart';
 import 'package:celechron/utils/platform_features.dart';
+import 'package:celechron/utils/utils.dart';
 
 /// 桌面端托盘常驻：关窗不退出，后台刷新定时器继续跑，成绩 / DDL 通知照常发。
 ///
@@ -17,7 +20,8 @@ import 'package:celechron/utils/platform_features.dart';
 /// 隐藏到托盘而不是退出进程，移动端「关掉界面照样提醒」的语义在桌面端
 /// 就变成了「关掉窗口照样提醒」。设置页可以关闭该行为，恢复关窗即退出。
 ///
-/// 托盘菜单：显示主窗口 / 立即刷新 / 退出。
+/// 托盘菜单动态化：顶部两条只读信息（下节课、今日 DDL）随课表/任务数据与
+/// 时间自动刷新，下面是显示主窗口 / 立即刷新 / 退出。
 class DesktopTrayService with WindowListener {
   DesktopTrayService._();
 
@@ -26,6 +30,9 @@ class DesktopTrayService with WindowListener {
   final SystemTray _tray = SystemTray();
   final Menu _menu = Menu();
   bool _started = false;
+  Timer? _menuTimer;
+  Worker? _scholarWorker;
+  Worker? _taskWorker;
 
   Future<void> start() async {
     if (!PlatformFeatures.isDesktop || _started) return;
@@ -43,13 +50,7 @@ class DesktopTrayService with WindowListener {
             Platform.isWindows ? 'assets/tray_icon.ico' : 'assets/logo.png',
         toolTip: 'PCelechron — 浙大时间管理器',
       );
-      await _menu.buildFrom([
-        MenuItemLabel(label: '显示主窗口', onClicked: (_) => showMainWindow()),
-        MenuItemLabel(label: '立即刷新', onClicked: (_) => _refreshFromTray()),
-        MenuSeparator(),
-        MenuItemLabel(label: '退出', onClicked: (_) => unawaited(exitApp())),
-      ]);
-      await _tray.setContextMenu(_menu);
+      await _refreshMenu();
       _tray.registerSystemTrayEventHandler((eventName) {
         if (eventName == kSystemTrayEventClick) {
           unawaited(showMainWindow());
@@ -68,6 +69,79 @@ class DesktopTrayService with WindowListener {
         error: error,
         stackTrace: stackTrace,
       );
+      return;
+    }
+
+    // 动态信息：数据变化即刷，时间流逝每分钟兜底刷一次。
+    try {
+      final scholar = Get.find<Rx<Scholar>>(tag: 'scholar');
+      final taskList = Get.find<RxList<Task>>(tag: 'taskList');
+      _scholarWorker = ever(scholar, (_) => unawaited(_refreshMenu()));
+      _taskWorker = ever(taskList, (_) => unawaited(_refreshMenu()));
+    } on Object {/* 数据源尚未注册时只靠定时器 */}
+    _menuTimer = Timer.periodic(const Duration(minutes: 1), (_) {
+      unawaited(_refreshMenu());
+    });
+  }
+
+  /// 重建托盘菜单：顶部动态信息（下节课 / 今日 DDL）+ 固定操作项。
+  Future<void> _refreshMenu() async {
+    try {
+      await _menu.buildFrom([
+        MenuItemLabel(label: _nextPeriodText(), enabled: false),
+        MenuItemLabel(label: _todayDdlText(), enabled: false),
+        MenuSeparator(),
+        MenuItemLabel(label: '显示主窗口', onClicked: (_) => showMainWindow()),
+        MenuItemLabel(label: '立即刷新', onClicked: (_) => _refreshFromTray()),
+        MenuSeparator(),
+        MenuItemLabel(label: '退出', onClicked: (_) => unawaited(exitApp())),
+      ]);
+      await _tray.setContextMenu(_menu);
+    } on Object catch (error, stackTrace) {
+      DiagnosticLogService.instance.record(
+        module: 'tray',
+        operation: 'refreshMenu',
+        message: '托盘菜单刷新失败',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
+  /// 今天（或正在进行）的下一条课程安排。
+  String _nextPeriodText() {
+    try {
+      final now = DateTime.now();
+      Period? next;
+      for (final p in Get.find<Rx<Scholar>>(tag: 'scholar').value.periods) {
+        if (!p.endTime.isAfter(now)) continue;
+        if (dateOnly(p.startTime) != dateOnly(now)) continue;
+        if (next == null || p.startTime.isBefore(next.startTime)) next = p;
+      }
+      if (next == null) return '今天没有更多课程';
+      final hh = next.startTime.hour.toString().padLeft(2, '0');
+      final mm = next.startTime.minute.toString().padLeft(2, '0');
+      final prefix = next.isRunning ? '正在上' : '下节课';
+      final place = next.location.isEmpty ? '' : ' · ${next.location}';
+      return '$prefix：${next.summary} $hh:$mm$place';
+    } on Object {
+      return '今天没有更多课程';
+    }
+  }
+
+  /// 今天到期的未完成 DDL 数。
+  String _todayDdlText() {
+    try {
+      final now = DateTime.now();
+      final count = Get.find<RxList<Task>>(tag: 'taskList')
+          .where((t) =>
+              t.type == TaskType.deadline &&
+              t.status == TaskStatus.running &&
+              dateOnly(t.endTime) == dateOnly(now))
+          .length;
+      return count > 0 ? '今日 DDL：$count 项待完成' : '今日没有 DDL';
+    } on Object {
+      return '今日没有 DDL';
     }
   }
 
@@ -95,6 +169,9 @@ class DesktopTrayService with WindowListener {
   }
 
   Future<void> exitApp() async {
+    _menuTimer?.cancel();
+    _scholarWorker?.dispose();
+    _taskWorker?.dispose();
     try {
       await _tray.destroy();
     } on Object {/* 托盘已不在也无妨 */}

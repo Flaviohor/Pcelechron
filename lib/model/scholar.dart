@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:get/get.dart';
 import 'package:flutter/foundation.dart';
 
 import 'package:celechron/http/zjuServices/exceptions.dart';
 import 'package:celechron/page/option/option_controller.dart';
+import 'package:celechron/services/ddl_schedule_service.dart';
 import 'package:celechron/services/diagnostic_log_service.dart';
 import 'package:celechron/services/refresh_coordinator.dart';
 import 'package:celechron/utils/json_utils.dart';
@@ -197,6 +200,8 @@ class Scholar {
     _spider?.logout();
     await _db?.removeScholar();
     await _db?.removeAllCachedWebPage();
+    // 登出后清空全部定时 DDL 提醒。
+    await DdlScheduleService.reschedule(const []);
     return true;
   }
 
@@ -334,6 +339,9 @@ class Scholar {
               updateLastUpdateTime(value.item2);
             }
             _applyFetchResult(value);
+
+            // 作业更新后重排精确 DDL 提醒（系统级定时通知）。
+            unawaited(DdlScheduleService.reschedule(value.item7));
 
             // 终态补发：最后完成的模块不会触发 onProgress，只能在这里定论
             emitStatuses(value.item2);

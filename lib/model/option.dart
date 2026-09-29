@@ -37,6 +37,9 @@ class Option {
   /// 桌面端：关闭窗口时隐藏到托盘而不是退出进程（后台刷新与通知依赖进程存活）。
   RxBool closeToTray;
 
+  /// 桌面端：开机自启动。
+  RxBool autoStart;
+
   Option({
     required this.workTime,
     required this.restTime,
@@ -49,5 +52,6 @@ class Option {
     required this.hideHomeGpa,
     required this.asyncRefresh,
     required this.closeToTray,
+    required this.autoStart,
   });
 }

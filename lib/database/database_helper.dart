@@ -59,6 +59,7 @@ class DatabaseHelper {
   final String kHideHomeGpa = 'hideHomeGpa';
   final String kAsyncRefresh = 'asyncRefresh';
   final String kCloseToTray = 'closeToTray';
+  final String kAutoStart = 'autoStart';
 
   Option getOption() {
     return Option(
@@ -73,6 +74,7 @@ class DatabaseHelper {
       hideHomeGpa: getHideHomeGpa().obs,
       asyncRefresh: getAsyncRefresh().obs,
       closeToTray: getCloseToTray().obs,
+      autoStart: getAutoStart().obs,
     );
   }
 
@@ -190,6 +192,19 @@ class DatabaseHelper {
 
   Future<void> setCloseToTray(bool closeToTray) async {
     await optionsBox.put(kCloseToTray, closeToTray);
+  }
+
+  /// 开机自启动：默认关闭。由 OptionController 调 launch_at_startup 落到
+  /// 系统（Windows 注册表 Run 键 / macOS 登录项 / Linux .desktop）。
+  bool getAutoStart() {
+    if (optionsBox.get(kAutoStart) == null) {
+      optionsBox.put(kAutoStart, false);
+    }
+    return optionsBox.get(kAutoStart);
+  }
+
+  Future<void> setAutoStart(bool autoStart) async {
+    await optionsBox.put(kAutoStart, autoStart);
   }
 
   List<CourseIdMap> getCourseIdMappingList() {

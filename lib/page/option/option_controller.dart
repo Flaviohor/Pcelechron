@@ -1,12 +1,16 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:get/get.dart';
+import 'package:launch_at_startup/launch_at_startup.dart';
 import 'package:flutter/cupertino.dart';
 
 import 'package:celechron/model/scholar.dart';
 import 'package:celechron/model/option.dart';
 import 'package:celechron/model/task.dart';
 import 'package:celechron/database/database_helper.dart';
+import 'package:celechron/services/ddl_schedule_service.dart';
+import 'package:celechron/services/diagnostic_log_service.dart';
 import 'package:celechron/services/notification_service.dart';
 import 'package:celechron/services/task_import_export_service.dart';
 import 'package:celechron/worker/ecard_widget_messenger.dart';
@@ -92,6 +96,8 @@ class OptionController extends GetxController {
         iOptions: secureStorageIOSOptions,
         mOptions: secureStorageMacOsOptions);
 
+    // 开关即时生效：重排（开启时按当前作业排程，关闭时清空定时）。
+    unawaited(DdlScheduleService.reschedule(scholar.value.todos));
     _updateBackgroundWorker(value || pushOnGradeChange);
   }
 
@@ -131,6 +137,39 @@ class OptionController extends GetxController {
   set closeToTray(bool value) {
     _option.closeToTray.value = value;
     _db.setCloseToTray(value);
+  }
+
+  bool get autoStart => _option.autoStart.value;
+
+  set autoStart(bool value) {
+    _option.autoStart.value = value;
+    _db.setAutoStart(value);
+    _updateAutoStart(value);
+  }
+
+  /// 开机自启落到系统层。失败只记日志，不打断设置流程。
+  void _updateAutoStart(bool value) {
+    try {
+      final launchAtStartup = LaunchAtStartup.instance;
+      launchAtStartup.setup(
+        appName: 'PCelechron',
+        appPath: Platform.resolvedExecutable,
+      );
+      if (value) {
+        unawaited(launchAtStartup.enable());
+      } else {
+        unawaited(launchAtStartup.disable());
+      }
+    } on Object catch (error, stackTrace) {
+      DiagnosticLogService.instance.record(
+        level: CelechronLogLevel.warning,
+        module: 'option',
+        operation: 'autoStart',
+        message: '开机自启设置失败',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
   }
 
   /// 设置页「发送测试通知」：当场验证系统通知链路。
