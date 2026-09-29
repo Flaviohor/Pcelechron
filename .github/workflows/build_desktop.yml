@@ -3,8 +3,14 @@ name: Build Desktop Apps
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
     inputs:
+      create_release:
+        description: '构建完成后自动创建 GitHub Release（tag push 触发时恒为创建）'
+        required: false
+        default: false
+        type: boolean
       target_platforms:
         description: |
           逗号分隔的架构列表。可选值：
@@ -471,3 +477,79 @@ jobs:
           path: pcelechron_*.deb
           archive: false
           if-no-files-found: error
+
+  release:
+    name: "Create GitHub Release"
+    runs-on: ubuntu-latest
+    # 构建按 target_platforms 裁剪，未选中的平台是 skipped 而不是失败；
+    # 所以用 always() + 结果检查：只要有失败/取消就不发版，全跳过也发（空 release 无意义，
+    # 但 push tags 时 target_platforms 条件为真，六个 job 都会跑）。
+    needs:
+      [
+        build-windows-x64,
+        build-windows-arm64,
+        build-windows-x86,
+        build-macos,
+        build-linux-x64,
+        build-linux-arm64,
+      ]
+    if: >-
+      always() &&
+      (github.event_name == 'push' || inputs.create_release == true) &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    steps:
+      - name: Resolve app version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            v="${{ github.event.inputs.version }}"
+            echo "version from workflow input override: $v"
+          elif [[ "${{ github.ref_name }}" == v* ]]; then
+            v="${{ github.ref_name#v }}"
+            echo "version from tag: $v"
+          else
+            git clone --depth 1 --branch "${{ github.ref_name }}" "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" repo 2>/dev/null || true
+            if [ -f repo/pubspec.yaml ]; then
+              v=$(sed -n 's/^version:[[:space:]]*//p' repo/pubspec.yaml | head -1 | cut -d+ -f1)
+            else
+              v="0.0.0"
+            fi
+            rm -rf repo
+            echo "version from pubspec.yaml: $v"
+          fi
+          echo "APP_VERSION=$v" >> "$GITHUB_ENV"
+          echo "APP_VERSION=$v"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # tag push 用已推送的 tag；dispatch 时按版本号自动打 v<ver> 标签
+          tag_name: ${{ github.event_name == 'push' && github.ref_name || format('v{0}', env.APP_VERSION) }}
+          name: "Pcelechron ${{ env.APP_VERSION }}"
+          body: |
+            PCelechron ${{ env.APP_VERSION }} 桌面版
+
+            - Windows x64 / x86 / arm64 安装器（*-setup.exe）与便携版
+            - macOS Apple Silicon 镜像（*-macos.dmg）
+            - Linux deb 包
+
+            应用内「设置 → 检查更新」会自动识别与本机架构匹配的安装包。
+          draft: false
+          prerelease: false
+          files: |
+            dist/*.exe
+            dist/*.zip
+            dist/*.dmg
+            dist/*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

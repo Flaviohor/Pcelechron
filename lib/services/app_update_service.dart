@@ -103,22 +103,8 @@ class AppUpdateController extends GetxController {
     phase.value = AppUpdatePhase.checking;
     errorMessage.value = '';
     try {
-      final request = await _httpClient.getUrl(Uri.parse(_releasesApi)).timeout(
-          const Duration(seconds: 10),
-          onTimeout: () => throw requestTimeout());
-      request.headers.add('Accept', 'application/vnd.github+json');
-      request.headers.add('X-GitHub-Api-Version', '2022-11-28');
-      final response = await request.close().timeout(
-            const Duration(seconds: 10),
-            onTimeout: () => throw requestTimeout(),
-          );
-      final body = await response.transform(utf8.decoder).join();
-      if (response.statusCode != HttpStatus.ok) {
-        throw ExceptionWithMessage(
-            'GitHub Releases 接口返回 HTTP ${response.statusCode}');
-      }
-      final releases = decodeJsonList(body,
-          context: 'GitHub Releases 接口；HTTP ${response.statusCode}');
+      final body = await _fetchReleasesWithRetry();
+      final releases = decodeJsonList(body, context: 'GitHub Releases 接口');
 
       for (final raw in releases) {
         final release = asStringMap(raw);
@@ -160,6 +146,51 @@ class AppUpdateController extends GetxController {
       errorMessage.value = shortErrorText(error);
       phase.value = AppUpdatePhase.failed;
     }
+  }
+
+  /// 拉取 releases 列表，失败后等 2 秒重试一次。
+  ///
+  /// GitHub API 在校园网/国内网络下不稳定，瞬态失败（超时、连接重置、
+  /// 偶发 5xx/403 限流）重发一次往往就能成功；两次都失败才判定为不可用。
+  Future<String> _fetchReleasesWithRetry() async {
+    Object? lastError;
+    StackTrace? lastStackTrace;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) {
+        await Future<void>.delayed(const Duration(seconds: 2));
+      }
+      try {
+        final request =
+            await _httpClient.getUrl(Uri.parse(_releasesApi)).timeout(
+                  const Duration(seconds: 10),
+                  onTimeout: () => throw requestTimeout(),
+                );
+        request.headers.add('Accept', 'application/vnd.github+json');
+        request.headers.add('X-GitHub-Api-Version', '2022-11-28');
+        final response = await request.close().timeout(
+              const Duration(seconds: 10),
+              onTimeout: () => throw requestTimeout(),
+            );
+        final body = await response.transform(utf8.decoder).join();
+        if (response.statusCode != HttpStatus.ok) {
+          throw ExceptionWithMessage(
+              'GitHub Releases 接口返回 HTTP ${response.statusCode}');
+        }
+        return body;
+      } on Object catch (error, stackTrace) {
+        lastError = error;
+        lastStackTrace = stackTrace;
+        DiagnosticLogService.instance.record(
+          level: CelechronLogLevel.warning,
+          module: 'update',
+          operation: 'fetchReleases',
+          message: '第 ${attempt + 1} 次拉取 releases 失败',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      }
+    }
+    Error.throwWithStackTrace(lastError!, lastStackTrace!);
   }
 
   /// 按当前平台与架构挑选安装包资产，命中时写入 [_assetName]/[_assetUrl]。
