@@ -36,6 +36,7 @@ class TaskJsonCodec {
       'repeatEndsTime': t.repeatEndsTime.toIso8601String(),
       'blockArrangements': t.blockArrangements,
       'fromUid': t.fromUid,
+      'courseId': t.courseId,
     };
   }
 
@@ -68,6 +69,7 @@ class TaskJsonCodec {
         repeatEndsTime: repeatEndsTime ?? endTime,
         blockArrangements: map['blockArrangements'] != false,
         fromUid: map['fromUid']?.toString(),
+        courseId: map['courseId']?.toString(),
       );
     } on Object {
       return null;

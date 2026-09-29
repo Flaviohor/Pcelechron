@@ -98,6 +98,8 @@ class Task {
   bool blockArrangements;
   @HiveField(15)
   String? fromUid;
+  @HiveField(16)
+  String? courseId;
 
   Task({
     this.uid = '114514',
@@ -116,6 +118,7 @@ class Task {
     required this.repeatEndsTime,
     this.blockArrangements = true,
     this.fromUid,
+    this.courseId,
   });
 
   void reset() {
@@ -138,6 +141,7 @@ class Task {
     repeatEndsTime = DateTime(startTime.year, startTime.month, startTime.day);
     blockArrangements = true;
     fromUid = null;
+    courseId = null;
   }
 
   void copy(Task another) {
@@ -157,6 +161,7 @@ class Task {
     repeatEndsTime = another.repeatEndsTime;
     blockArrangements = another.blockArrangements;
     fromUid = another.fromUid;
+    courseId = another.courseId;
   }
 
   Task copyWith({
@@ -176,6 +181,7 @@ class Task {
     DateTime? repeatEndsTime,
     bool? blockArrangements,
     String? fromUid,
+    String? courseId,
   }) {
     return Task(
       uid: uid ?? this.uid,
@@ -194,6 +200,7 @@ class Task {
       repeatEndsTime: repeatEndsTime ?? this.repeatEndsTime,
       blockArrangements: blockArrangements ?? this.blockArrangements,
       fromUid: fromUid ?? this.fromUid,
+      courseId: courseId ?? this.courseId,
     );
   }
 

@@ -1,4 +1,7 @@
 import 'package:flutter/cupertino.dart';
+import 'package:get/get.dart';
+import 'package:celechron/model/course.dart';
+import 'package:celechron/model/scholar.dart';
 import 'package:celechron/model/task.dart';
 import 'package:celechron/utils/utils.dart';
 import 'package:celechron/utils/time_helper.dart';
@@ -103,6 +106,63 @@ class _TaskEditPageState extends State<TaskEditPage> {
     Navigator.of(context).pop(now);
   }
 
+  List<Course> _courseOptions() {
+    final courses = <String, Course>{};
+    for (final semester
+        in Get.find<Rx<Scholar>>(tag: 'scholar').value.semesters) {
+      for (final course in semester.courses.values) {
+        final id = course.id;
+        if (id == null) continue;
+        courses.putIfAbsent(id, () => course);
+      }
+    }
+    return courses.values.toList();
+  }
+
+  String? _courseNameOf(String id) {
+    for (final course in _courseOptions()) {
+      if (course.id == id) return course.name;
+    }
+    return null;
+  }
+
+  Future<void> _pickCourse(BuildContext context) async {
+    await showCupertinoModalPopup<void>(
+      context: context,
+      builder: (BuildContext sheetContext) {
+        final options = _courseOptions();
+        return CupertinoActionSheet(
+          title: const Text('选择要关联的课程'),
+          actions: <CupertinoActionSheetAction>[
+            if (now.courseId != null)
+              CupertinoActionSheetAction(
+                onPressed: () {
+                  setState(() => now.courseId = null);
+                  Navigator.of(sheetContext).pop();
+                },
+                isDestructiveAction: true,
+                child: const Text('取消关联'),
+              ),
+            for (final course in options)
+              CupertinoActionSheetAction(
+                onPressed: () {
+                  setState(() => now.courseId = course.id);
+                  Navigator.of(sheetContext).pop();
+                },
+                child: Text(course.teacher == null || course.teacher!.isEmpty
+                    ? course.name
+                    : '${course.name} · ${course.teacher}'),
+              ),
+          ],
+          cancelButton: CupertinoActionSheetAction(
+            onPressed: () => Navigator.of(sheetContext).pop(),
+            child: const Text('取消'),
+          ),
+        );
+      },
+    );
+  }
+
   void exitWithoutSave() {
     now = widget.deadline.copyWith();
     Navigator.of(context).pop(now);
@@ -128,10 +188,9 @@ class _TaskEditPageState extends State<TaskEditPage> {
     }
 
     return CupertinoPageScaffold(
-      backgroundColor: CupertinoColors.systemGroupedBackground,
+      backgroundColor: const Color(0x00000000),
       navigationBar: CupertinoNavigationBar(
-        backgroundColor: CupertinoDynamicColor.resolve(
-            CupertinoColors.systemGroupedBackground, context),
+        backgroundColor: const Color(0x00000000),
         leading: CupertinoButton(
           padding: EdgeInsets.zero,
           onPressed: exitWithoutSave,
@@ -640,6 +699,20 @@ class _TaskEditPageState extends State<TaskEditPage> {
                 CupertinoListSection.insetGrouped(
                   header: const Text('附加信息'),
                   children: [
+                    CupertinoListTile(
+                      title: const Text('关联课程'),
+                      trailing: Text(
+                        now.courseId == null
+                            ? '未关联'
+                            : (_courseNameOf(now.courseId!) ?? '已关联课程'),
+                        style: TextStyle(
+                          fontSize: 15,
+                          color: CupertinoDynamicColor.resolve(
+                              CupertinoColors.secondaryLabel, context),
+                        ),
+                      ),
+                      onTap: () => _pickCourse(context),
+                    ),
                     CupertinoTextFormFieldRow(
                       placeholder: '地点',
                       textAlign: TextAlign.left,

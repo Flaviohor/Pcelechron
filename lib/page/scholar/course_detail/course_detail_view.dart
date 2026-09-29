@@ -11,15 +11,21 @@ import 'package:celechron/model/course.dart';
 import 'package:celechron/model/exam.dart';
 import 'package:celechron/model/session.dart';
 import 'package:celechron/model/scholar.dart';
+import 'package:celechron/model/task.dart';
+import 'package:celechron/utils/utils.dart';
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
+import 'package:url_launcher/url_launcher_string.dart';
 
 class CourseDetailPage extends StatelessWidget {
   final _scholar = Get.find<Rx<Scholar>>(tag: 'scholar');
   late final Course course;
+  late final String _courseId;
 
   CourseDetailPage({required courseId, super.key}) {
     course = _scholar.value.semesters
         .firstWhere((e) => e.courses.containsKey(courseId))
         .courses[courseId]!;
+    _courseId = courseId.toString();
   }
 
   Widget createSessionCard(context, List<Session> sessions) {
@@ -397,8 +403,7 @@ class CourseDetailPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return CupertinoPageScaffold(
-      backgroundColor: CupertinoDynamicColor.resolve(
-          CupertinoColors.systemGroupedBackground, context),
+      backgroundColor: const Color(0x00000000),
       child: CustomScrollView(
         slivers: [
           const CelechronSliverTextHeader(subtitle: '课程详情'),
@@ -429,8 +434,186 @@ class CourseDetailPage extends StatelessWidget {
                 child: createExamCard(context, course.exams),
               ),
             ),
+          SliverToBoxAdapter(
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 5),
+              child: _buildCourseTasksSection(context),
+            ),
+          ),
+          SliverToBoxAdapter(
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 5),
+              child: _buildClassroomSection(context),
+            ),
+          ),
         ],
       ),
+    );
+  }
+
+  /// 本课任务：编辑页里关联到本课程的用户任务 + 按课程名匹配的学在浙大作业。
+  Widget _buildCourseTasksSection(BuildContext context) {
+    final taskList = Get.find<RxList<Task>>(tag: 'taskList');
+    final mountedTasks = taskList
+        .where((t) => t.courseId != null && t.courseId == _courseId)
+        .toList()
+      ..sort((a, b) => a.endTime.compareTo(b.endTime));
+    final todos = _scholar.value.todos
+        .where((t) => _matchesCourseName(t.course))
+        .toList()
+      ..sort((a, b) =>
+          (a.endTime ?? DateTime(2001)).compareTo(b.endTime ?? DateTime(2001)));
+    if (mountedTasks.isEmpty && todos.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    final secondaryStyle = TextStyle(
+      fontSize: 13,
+      color: CupertinoDynamicColor.resolve(
+          CupertinoColors.secondaryLabel, context),
+    );
+
+    return Column(
+      children: [
+        SubSubtitleRow(subtitle: '本课任务'),
+        RoundRectangleCard(
+          child: Padding(
+            padding:
+                const EdgeInsets.only(left: 8, right: 8, top: 6, bottom: 6),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                for (final task in mountedTasks)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 10,
+                          height: 10,
+                          decoration: BoxDecoration(
+                            color: task.status == TaskStatus.completed
+                                ? CupertinoColors.systemGreen
+                                : TimeColors.colorFromHour(task.startTime.hour),
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(task.summary,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: CupertinoTheme.of(context)
+                                  .textTheme
+                                  .textStyle),
+                        ),
+                        Text(toStringHumanReadable(task.endTime),
+                            style: secondaryStyle),
+                      ],
+                    ),
+                  ),
+                for (final todo in todos)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 10,
+                          height: 10,
+                          decoration: const BoxDecoration(
+                            color: CupertinoColors.systemOrange,
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text('作业：${todo.name}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: CupertinoTheme.of(context)
+                                  .textTheme
+                                  .textStyle),
+                        ),
+                        Text(
+                            todo.endTime == null
+                                ? '无截止'
+                                : toStringHumanReadable(todo.endTime!),
+                            style: secondaryStyle),
+                      ],
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  bool _matchesCourseName(String? todoCourse) {
+    if (todoCourse == null || todoCourse.trim().isEmpty) return false;
+    final a = todoCourse.replaceAll(RegExp(r"[ \t]+"), '');
+    final b = course.name.replaceAll(RegExp(r"[ \t]+"), '');
+    if (a.isEmpty || b.isEmpty) return false;
+    return a.contains(b) || b.contains(a);
+  }
+
+  /// 智云课堂入口卡片。
+  ///
+  /// 调研结论（2026-09）：自动匹配课程 → 回放页需要登录智云课堂后调
+  /// `https://classroom.zju.edu.cn/userapi/v1/infosimple` 拿 user_id/tenant_id，
+  /// 再调 `https://yjapi.cmc.zju.edu.cn/courseapi/v2/schedule/get-week-schedules`
+  /// 拉课表（见上游 issue #144）；但该站仅校园网/VPN 可达（本机与外部网络
+  /// 均无法直连验证），CAS 到 Bearer token 的换取链路未经抓包确认。
+  /// 因此 v1 采用「打开官网 + 自动复制课程名」的可靠方案，token 链路验证后
+  /// 可把这里升级为直接跳转对应课程页。
+  Widget _buildClassroomSection(BuildContext context) {
+    return Column(
+      children: [
+        SubSubtitleRow(subtitle: '课堂回放'),
+        RoundRectangleCard(
+          onTap: () async {
+            await Clipboard.setData(ClipboardData(text: course.name));
+            await launchUrlString('https://classroom.zju.edu.cn/',
+                mode: LaunchMode.externalApplication);
+          },
+          child: Padding(
+            padding: const EdgeInsets.only(left: 8, right: 8),
+            child: Row(
+              children: [
+                const Icon(CupertinoIcons.play_circle,
+                    size: 26, color: CupertinoColors.activeBlue),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('在智云课堂中查看「${course.name}」',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: CupertinoTheme.of(context)
+                              .textTheme
+                              .textStyle
+                              .copyWith(
+                                  fontSize: 15, fontWeight: FontWeight.w600)),
+                      Text('已复制课程名，打开后粘贴搜索即可（限校园网）',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: CupertinoDynamicColor.resolve(
+                                CupertinoColors.secondaryLabel, context),
+                          )),
+                    ],
+                  ),
+                ),
+                Icon(CupertinoIcons.chevron_right,
+                    size: 14,
+                    color: CupertinoDynamicColor.resolve(
+                        CupertinoColors.tertiaryLabel, context)),
+              ],
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
