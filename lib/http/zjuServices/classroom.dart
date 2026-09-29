@@ -20,17 +20,23 @@ import 'package:celechron/http/zjuServices/response_utils.dart';
 /// 参考：zzw4257/celechron-tauri `classroom.rs`、PeiPei233/zju-learning-assistant
 /// `zju_assist.rs`、上游 issue #144。
 ///
-/// ## 课程搜索
+/// ## 课程匹配：从「我的课程」入手
 ///
-/// `pptnote/v1/searchlist?title=<课程名>&realname=<教师>`（Bearer），是官网
-/// 自身搜索页调用的接口，返回 `total.list[]`（含 course_id/title/realname）。
+/// `courseapi/v2/course-live/get-my-course-month?month=YYYY-MM`（Bearer）
+/// 返回当月本人账号的全部课节：`list[]` 为天对象数组，每项的 `course[]`
+/// 是课节对象（`id` 课程号 / `sub_id` 课节号 / `title` 课程名 / `sub_title`
+/// 节次名 / `realname` 教师，均为字符串）。取上月、本月、下月三次，
+/// 覆盖学期边界；天按升序排列，迭代序最后一节即最近一节。
 ///
-/// ## 关于「直达链接」
+/// 之所以不用搜索接口 `pptnote/v1/searchlist`：它返回的是全站可搜课程而
+/// 非本人课程，搜得到不等于你的账号里有这门课的回放，实测导致「明明有课
+/// 却识别成没课」。账号里确实存在的课节才是有无直播/回放的依据。
 ///
-/// 站点是 hash 路由 SPA，公开代码里没有构造课程页 URL 的先例（所有工具都
-/// 走 API 拿数据而非跳页面）。本实现采用 `#/course/<courseId>` 作为最可能的
-/// 直达路由——hash 路由拼错的后果只是落到 SPA 默认页，不会 404；调用方须
-/// 同时把课程名写入剪贴板兜底（官网搜索一贴即中）。
+/// ## 直达链接（用户实测确认的格式）
+///
+/// `https://classroom.zju.edu.cn/livingroom?course_id=<id>&sub_id=<sub_id>&tenant_code=112`
+/// 该页同时支持直播与回放；对整门课取最近一节（迭代序最后一条）。早先
+/// 猜测的 `#/course/<id>` 路由是错的（只会落到官网首页）。
 class ClassroomService {
   ClassroomService._();
 
@@ -41,10 +47,6 @@ class ClassroomService {
   static const _userAgent =
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
-
-  static const _searchlistUrl =
-      'https://classroom.zju.edu.cn/pptnote/v1/searchlist';
-  static const _tenantId = '112';
 
   static _ClassroomSession? _session;
   static final Map<String, ClassroomMatch?> _matchCache = {};
@@ -77,11 +79,11 @@ class ClassroomService {
     _matchCache.clear();
   }
 
-  /// 在智云课堂里解析本课程：匹配 + 子节（课时）数。
+  /// 在智云课堂「我的课程」里解析本课程：匹配课程 + 课节数 + 最近一节。
   ///
-  /// 返回 null 的三种情况调用方都应视为「不展示卡片」：没搜到对应课程、
-  /// 课程还没有任何子节（尚未上课 / 回放未生成）、查找过程失败（如不在
-  /// 校园网）。子节数经 get-course-detail 确认，避免给用户一个空页面。
+  /// 返回 null 的三种情况调用方都应视为「不展示卡片」：我的课程里没有
+  /// 这门课（尚未上过课）、查找过程失败（如不在校园网）。账号里确实
+  /// 存在课节，才说明有直播/回放可看。
   static Future<ClassroomMatch?> resolveCourse({
     required String courseName,
     String? teacher,
@@ -93,61 +95,120 @@ class ClassroomService {
 
     final session =
         await _ensureSession(username: username, password: password);
-    final candidates = await _searchCourses(session, courseName, teacher);
-    final best = _pickBest(candidates, courseName, teacher);
-    if (best == null) {
+    final lessons = await _fetchMyLessons(session);
+
+    // 归一化后挑选最匹配的课程：名字互含 + 教师命中加分。
+    final target = _normalize(courseName);
+    final teacherKey = _normalize(teacher ?? '');
+    final subIds = <int>{};
+    int? latestCourseId;
+    int? latestSubId;
+    String bestTitle = '';
+    String bestRealname = '';
+    var bestScore = 0;
+
+    for (final lesson in lessons) {
+      final title = _normalize(lesson.title);
+      if (title.isEmpty) continue;
+      var score = 0;
+      if (title == target) {
+        score = 3;
+      } else if (title.contains(target) || target.contains(title)) {
+        score = title.length >= 4 || target.length >= 4 ? 2 : 0;
+      }
+      if (score <= 0) continue;
+      if (teacherKey.isNotEmpty) {
+        final lecturer = _normalize(lesson.realname);
+        if (lecturer.isNotEmpty &&
+            (lecturer.contains(teacherKey) || teacherKey.contains(lecturer))) {
+          score += 1;
+        } else if (bestScore > 0) {
+          // 教师写法不一致时降权而非淘汰，让同教师的课程优先。
+          score -= 1;
+        }
+      }
+      if (score >= bestScore) {
+        if (score > bestScore) {
+          bestScore = score;
+          subIds.clear();
+        }
+        bestTitle = lesson.title;
+        bestRealname = lesson.realname;
+        subIds.add(lesson.subId);
+        latestCourseId = lesson.courseId;
+        latestSubId = lesson.subId;
+      }
+    }
+
+    if (latestCourseId == null || latestSubId == null || subIds.isEmpty) {
       _matchCache[cacheKey] = null;
       return null;
     }
-    final subCount = await _countSubs(session, best.courseId);
-    final match = subCount == null
-        ? null
-        : ClassroomMatch(course: best, subCount: subCount);
+    final match = ClassroomMatch(
+      course: ClassroomCourse(
+        courseId: latestCourseId,
+        title: bestTitle,
+        realname: bestRealname,
+      ),
+      subCount: subIds.length,
+      latestSubId: latestSubId,
+    );
     _matchCache[cacheKey] = match;
     return match;
   }
 
-  /// get-course-detail 的 sub_list 是 年→月→周→子节 的嵌套结构，
-  /// 递归数出所有带 id 的子节对象；接口失败返回 null（与 0 区分开）。
-  static Future<int?> _countSubs(
-      _ClassroomSession session, int courseId) async {
-    final uri = Uri.parse(
-            'https://yjapi.cmc.zju.edu.cn/courseapi/v3/multi-search/get-course-detail')
-        .replace(queryParameters: {
-      'course_id': '$courseId',
-      'student': session.account,
-    });
-    final request = await session.httpClient.openUrl('GET', uri);
-    request.headers.set('User-Agent', _userAgent);
-    request.headers.set('Authorization', 'Bearer ${session.token}');
-    final response = await request.close().timeout(
-          const Duration(seconds: 8),
-          onTimeout: () => throw requestTimeout(),
-        );
-    final body = await response.transform(utf8.decoder).join();
-    final payload = decodeJsonMap(body, context: '智云课堂课程详情');
-    if (asInt(payload['code']) != null && asInt(payload['code']) != 0) {
-      throw ExceptionWithMessage('智云课堂课程详情失败：${asString(payload['msg'])}');
+  /// 拉取上月/本月/下月的「我的课程」课节，按 subId 去重。
+  static Future<List<ClassroomLesson>> _fetchMyLessons(
+      _ClassroomSession session) async {
+    final now = DateTime.now();
+    final months = <String>{
+      _monthKey(DateTime(now.year, now.month - 1, 1)),
+      _monthKey(now),
+      _monthKey(DateTime(now.year, now.month + 1, 1)),
+    };
+    final lessons = <ClassroomLesson>[];
+    final seenSubIds = <int>{};
+    for (final month in months) {
+      final uri = Uri.parse(
+              'https://classroom.zju.edu.cn/courseapi/v2/course-live/get-my-course-month')
+          .replace(queryParameters: {'month': month});
+      final request = await session.httpClient.openUrl('GET', uri);
+      request.headers.set('User-Agent', _userAgent);
+      request.headers.set('Authorization', 'Bearer ${session.token}');
+      final response = await request.close().timeout(
+            const Duration(seconds: 8),
+            onTimeout: () => throw requestTimeout(),
+          );
+      final body = await response.transform(utf8.decoder).join();
+      final payload = decodeJsonMap(body, context: '智云课堂我的课程');
+      final days = asDynamicList(payload['list']) ?? const [];
+      for (final rawDay in days) {
+        final day = asStringMap(rawDay);
+        if (day == null) continue;
+        for (final rawLesson in asDynamicList(day['course']) ?? const []) {
+          final lesson = asStringMap(rawLesson);
+          if (lesson == null) continue;
+          final courseId = _asId(lesson['id']);
+          final subId = _asId(lesson['sub_id']);
+          if (courseId == null || subId == null || seenSubIds.contains(subId)) {
+            continue;
+          }
+          seenSubIds.add(subId);
+          lessons.add(ClassroomLesson(
+            courseId: courseId,
+            subId: subId,
+            title: (asString(lesson['title']) ?? '').trim(),
+            subTitle: (asString(lesson['sub_title']) ?? '').trim(),
+            realname: (asString(lesson['realname']) ?? '').trim(),
+          ));
+        }
+      }
     }
-    final data = asStringMap(payload['data']);
-    if (data == null) return 0;
-    return _countSubNodes(data['sub_list']);
+    return lessons;
   }
 
-  static int _countSubNodes(Object? node) {
-    if (node is Map) {
-      if (node.containsKey('id') && node.containsKey('sub_title')) return 1;
-      var total = 0;
-      for (final value in node.values) {
-        total += _countSubNodes(value);
-      }
-      return total;
-    }
-    if (node is List) {
-      return node.fold(0, (sum, item) => sum + _countSubNodes(item));
-    }
-    return 0;
-  }
+  static String _monthKey(DateTime date) =>
+      '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}';
 
   // ===== 登录 =====
 
@@ -300,93 +361,6 @@ class ClassroomService {
     }
   }
 
-  // ===== 课程搜索 =====
-
-  static Future<List<ClassroomCourse>> _searchCourses(
-      _ClassroomSession session, String title, String? teacher) async {
-    final courses = <ClassroomCourse>[];
-    for (var page = 1; page <= 3; page++) {
-      final uri = Uri.parse(_searchlistUrl).replace(queryParameters: {
-        'tenant_id': _tenantId,
-        'tenant_code': _tenantId,
-        'user_id': session.userId,
-        'user_name': session.account,
-        'page': '$page',
-        'per_page': '16',
-        'title': title,
-        'realname': teacher ?? '',
-        'trans': '',
-        'randomKey':
-            DateTime.now().microsecondsSinceEpoch.remainder(100000).toString(),
-      });
-      final request = await session.httpClient.openUrl('GET', uri);
-      request.headers.set('User-Agent', _userAgent);
-      request.headers.set('Authorization', 'Bearer ${session.token}');
-      final response = await request.close().timeout(
-            const Duration(seconds: 8),
-            onTimeout: () => throw requestTimeout(),
-          );
-      final body = await response.transform(utf8.decoder).join();
-      final payload = decodeJsonMap(body, context: '智云课堂课程搜索');
-      final code = asInt(payload['code']);
-      if (code != null && code != 0) {
-        throw ExceptionWithMessage(
-            '智云课堂课程搜索失败：${asString(payload['msg']) ?? code}');
-      }
-      final total = asStringMap(payload['total']) ?? {};
-      final list = asDynamicList(total['list']) ?? const [];
-      for (final raw in list) {
-        final item = asStringMap(raw);
-        if (item == null) continue;
-        final courseId = _asId(item['course_id'] ?? item['id']);
-        if (courseId == null || courseId <= 0) continue;
-        courses.add(ClassroomCourse(
-          courseId: courseId,
-          title: (asString(item['title']) ?? '').trim(),
-          realname: (asString(item['realname']) ??
-                  asString(item['teacher_name']) ??
-                  '')
-              .trim(),
-        ));
-      }
-      final totalCount = asInt(total['total']) ?? courses.length;
-      if (courses.length >= totalCount || list.isEmpty) break;
-    }
-    return courses;
-  }
-
-  /// 归一化后挑选最匹配的课程：名字互含 + 教师命中加分。
-  static ClassroomCourse? _pickBest(
-      List<ClassroomCourse> candidates, String courseName, String? teacher) {
-    final target = _normalize(courseName);
-    if (target.isEmpty) return null;
-    final teacherKey = _normalize(teacher ?? '');
-    ClassroomCourse? best;
-    var bestScore = 0;
-    for (final candidate in candidates) {
-      final title = _normalize(candidate.title);
-      if (title.isEmpty) continue;
-      var score = 0;
-      if (title == target) {
-        score = 3;
-      } else if (title.contains(target) || target.contains(title)) {
-        score = title.length >= 4 || target.length >= 4 ? 2 : 0;
-      }
-      if (score > 0 && teacherKey.isNotEmpty) {
-        final lecturer = _normalize(candidate.realname);
-        if (lecturer.isNotEmpty &&
-            (lecturer.contains(teacherKey) || teacherKey.contains(lecturer))) {
-          score += 1;
-        }
-      }
-      if (score > bestScore) {
-        bestScore = score;
-        best = candidate;
-      }
-    }
-    return best;
-  }
-
   static String _normalize(String input) =>
       input.replaceAll(RegExp(r'\s+'), '').trim();
 
@@ -397,12 +371,34 @@ class ClassroomService {
   }
 }
 
-/// 一次成功解析的智云课堂课程：匹配条目 + 子节（课时/回放）数。
+/// 一次成功解析的智云课堂课程：匹配条目 + 课节数 + 最近一节。
 class ClassroomMatch {
   final ClassroomCourse course;
   final int subCount;
+  final int latestSubId;
 
-  const ClassroomMatch({required this.course, required this.subCount});
+  const ClassroomMatch({
+    required this.course,
+    required this.subCount,
+    required this.latestSubId,
+  });
+}
+
+/// 「我的课程」里的一条课节（一次上课对应一个 sub_id）。
+class ClassroomLesson {
+  final int courseId;
+  final int subId;
+  final String title;
+  final String subTitle;
+  final String realname;
+
+  const ClassroomLesson({
+    required this.courseId,
+    required this.subId,
+    required this.title,
+    required this.subTitle,
+    required this.realname,
+  });
 }
 
 class ClassroomCourse {

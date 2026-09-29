@@ -635,8 +635,11 @@ class _ClassroomSectionState extends State<_ClassroomSection> {
 
     // 课程名始终先进剪贴板：即使直达路由未命中，官网搜索一贴即中。
     await Clipboard.setData(ClipboardData(text: widget.course.name));
+    // 直达最近一节课的直播/回放页（用户实测确认的 URL 格式）。
     await launchUrlString(
-        'https://classroom.zju.edu.cn/#/course/${_match!.course.courseId}',
+        'https://classroom.zju.edu.cn/livingroom?course_id='
+        '${_match!.course.courseId}'
+        '&sub_id=${_match!.latestSubId}&tenant_code=112',
         mode: LaunchMode.externalApplication);
     if (mounted) {
       setState(() {
@@ -708,8 +711,8 @@ class _ClassroomSectionState extends State<_ClassroomSection> {
                                         fontWeight: FontWeight.w600)),
                             Text(
                               _match!.course.realname.isEmpty
-                                  ? '已匹配到 ${_match!.subCount} 节课，点击直达'
-                                  : '已匹配到 ${_match!.subCount} 节课 · ${_match!.course.realname}，点击直达',
+                                  ? '我的课程里匹配到 ${_match!.subCount} 节课，点击直达最近一节'
+                                  : '我的课程里匹配到 ${_match!.subCount} 节课 · ${_match!.course.realname}，点击直达最近一节',
                               maxLines: 2,
                               overflow: TextOverflow.ellipsis,
                               style: TextStyle(
