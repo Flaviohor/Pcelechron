@@ -27,6 +27,7 @@ import 'grade_detail/grade_detail_view.dart';
 import 'practice_score/practice_score_page.dart';
 import 'scholar_controller.dart';
 import 'package:celechron/page/option/option_controller.dart';
+import 'package:celechron/design/glass_route.dart';
 
 Future<void> showRefreshResultDialog(
     BuildContext context, List<String?> results) async {
@@ -262,7 +263,7 @@ class ScholarPage extends StatelessWidget {
                                 ])),
                             onTap: () async =>
                                 Navigator.of(context, rootNavigator: true).push(
-                                    CupertinoPageRoute(
+                                    GlassPageRoute(
                                         builder: (context) => GradeDetailPage(),
                                         fullscreenDialog: true)),
                             child: Column(
@@ -461,7 +462,7 @@ class ScholarPage extends StatelessWidget {
                               titles: const ['课程', '学分', '考试'],
                               onTaps: [
                                 () => Navigator.of(context, rootNavigator: true)
-                                    .push(CupertinoPageRoute(
+                                    .push(GlassPageRoute(
                                         builder: (context) => CourseListPage(
                                             initialSemesterName:
                                                 _scholarController
@@ -469,7 +470,7 @@ class ScholarPage extends StatelessWidget {
                                         title: '课程')),
                                 null,
                                 () => Navigator.of(context, rootNavigator: true)
-                                    .push(CupertinoPageRoute(
+                                    .push(GlassPageRoute(
                                         builder: (context) => ExamListPage(
                                             initialSemesterName:
                                                 _scholarController
@@ -487,7 +488,7 @@ class ScholarPage extends StatelessWidget {
                                       onTap: () => Navigator.of(context,
                                                   rootNavigator: true)
                                               .push(
-                                            CupertinoPageRoute(
+                                            GlassPageRoute(
                                               builder: (context) =>
                                                   CourseSchedulePage(
                                                       _scholarController
@@ -515,7 +516,7 @@ class ScholarPage extends StatelessWidget {
                                       onTap: () => Navigator.of(context,
                                                   rootNavigator: true)
                                               .push(
-                                            CupertinoPageRoute(
+                                            GlassPageRoute(
                                               builder: (context) =>
                                                   CourseSchedulePage(
                                                       _scholarController
@@ -773,193 +774,205 @@ class ScholarPage extends StatelessWidget {
                   sigmaY: PlatformFeatures.isDesktop ? 18 : 0,
                 ),
                 child: Container(
-              decoration: BoxDecoration(
-                color: PlatformFeatures.isDesktop
-                    ? const Color(0x00000000)
-                    : CupertinoDynamicColor.resolve(
-                        CupertinoColors.systemBackground, context),
-              ),
-              child: Padding(
-                  padding: EdgeInsets.only(
-                      left: 16,
-                      right: 16,
-                      bottom: 4,
-                      top: 8 + MediaQuery.of(context).padding.top),
-                  child: Column(children: [
-                    Row(
-                      children: [
-                        const SizedBox(width: 2),
-                        Text(
-                          '学业',
-                          style: CupertinoTheme.of(context)
-                              .textTheme
-                              .navLargeTitleTextStyle
-                              .copyWith(fontSize: 24),
+                  decoration: BoxDecoration(
+                    color: PlatformFeatures.isDesktop
+                        ? const Color(0x00000000)
+                        : CupertinoDynamicColor.resolve(
+                            CupertinoColors.systemBackground, context),
+                  ),
+                  child: Padding(
+                      padding: EdgeInsets.only(
+                          left: 16,
+                          right: 16,
+                          bottom: 4,
+                          top: 8 + MediaQuery.of(context).padding.top),
+                      child: Column(children: [
+                        Row(
+                          children: [
+                            const SizedBox(width: 2),
+                            Text(
+                              '学业',
+                              style: CupertinoTheme.of(context)
+                                  .textTheme
+                                  .navLargeTitleTextStyle
+                                  .copyWith(fontSize: 24),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: CupertinoSearchTextField(
+                                placeholder: '搜索课程、事项...',
+                                placeholderStyle: CupertinoTheme.of(context)
+                                    .textTheme
+                                    .textStyle
+                                    .copyWith(
+                                        color: CupertinoColors.systemGrey,
+                                        height: 1.25,
+                                        fontSize: 18),
+                                style: CupertinoTheme.of(context)
+                                    .textTheme
+                                    .textStyle
+                                    .copyWith(height: 1.25, fontSize: 18),
+                                borderRadius: BorderRadius.circular(12),
+                                itemColor: CupertinoColors.systemGrey,
+                                itemSize: 20,
+                                suffixInsets:
+                                    const EdgeInsetsDirectional.fromSTEB(
+                                        0, 0, 5, 0),
+                                prefixInsets:
+                                    const EdgeInsetsDirectional.fromSTEB(
+                                        10, 0, 0, 0),
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 6, vertical: 8),
+                                onTap: () async {
+                                  FocusManager.instance.primaryFocus?.unfocus();
+                                  Navigator.of(context, rootNavigator: true)
+                                      .push(GlassPageRoute(
+                                          builder: (context) => SearchPage()));
+                                },
+                                focusNode: AlwaysDisabledFocusNode(),
+                                // Do not popup the keyboard
+                              ),
+                            ),
+                            if (PlatformFeatures.isDesktop)
+                              ValueListenableBuilder(
+                                  valueListenable: _isRefreshing,
+                                  builder: (context, isRefreshing, child) =>
+                                      CupertinoButton(
+                                        onPressed: isRefreshing
+                                            ? null
+                                            : () async {
+                                                _isRefreshing.value = true;
+                                                late final List<String?>
+                                                    results;
+                                                try {
+                                                  results =
+                                                      await _scholarController
+                                                          .fetchData();
+                                                } finally {
+                                                  _isRefreshing.value = false;
+                                                }
+                                                if (context.mounted &&
+                                                    results.any((result) =>
+                                                        result != null)) {
+                                                  await showRefreshResultDialog(
+                                                      context, results);
+                                                }
+                                              },
+                                        child: isRefreshing
+                                            ? const CupertinoActivityIndicator()
+                                            : Icon(
+                                                CupertinoIcons.refresh,
+                                                color: CupertinoDynamicColor
+                                                    .resolve(
+                                                        CupertinoColors
+                                                            .systemBlue,
+                                                        context),
+                                                size: 20,
+                                              ),
+                                      ))
+                          ],
                         ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: CupertinoSearchTextField(
-                            placeholder: '搜索课程、事项...',
-                            placeholderStyle: CupertinoTheme.of(context)
-                                .textTheme
-                                .textStyle
-                                .copyWith(
-                                    color: CupertinoColors.systemGrey,
-                                    height: 1.25,
-                                    fontSize: 18),
-                            style: CupertinoTheme.of(context)
-                                .textTheme
-                                .textStyle
-                                .copyWith(height: 1.25, fontSize: 18),
-                            borderRadius: BorderRadius.circular(12),
-                            itemColor: CupertinoColors.systemGrey,
-                            itemSize: 20,
-                            suffixInsets: const EdgeInsetsDirectional.fromSTEB(
-                                0, 0, 5, 0),
-                            prefixInsets: const EdgeInsetsDirectional.fromSTEB(
-                                10, 0, 0, 0),
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 6, vertical: 8),
-                            onTap: () async {
-                              FocusManager.instance.primaryFocus?.unfocus();
-                              Navigator.of(context, rootNavigator: true).push(
-                                  CupertinoPageRoute(
-                                      builder: (context) => SearchPage()));
-                            },
-                            focusNode: AlwaysDisabledFocusNode(),
-                            // Do not popup the keyboard
-                          ),
-                        ),
-                        if (PlatformFeatures.isDesktop)
-                          ValueListenableBuilder(
-                              valueListenable: _isRefreshing,
-                              builder: (context, isRefreshing, child) =>
-                                  CupertinoButton(
-                                    onPressed: isRefreshing
-                                        ? null
-                                        : () async {
-                                            _isRefreshing.value = true;
-                                            late final List<String?> results;
-                                            try {
-                                              results = await _scholarController
-                                                  .fetchData();
-                                            } finally {
-                                              _isRefreshing.value = false;
-                                            }
-                                            if (context.mounted &&
-                                                results.any((result) =>
-                                                    result != null)) {
-                                              await showRefreshResultDialog(
-                                                  context, results);
-                                            }
-                                          },
-                                    child: isRefreshing
-                                        ? const CupertinoActivityIndicator()
-                                        : Icon(
-                                            CupertinoIcons.refresh,
-                                            color:
-                                                CupertinoDynamicColor.resolve(
-                                                    CupertinoColors.systemBlue,
-                                                    context),
-                                            size: 20,
-                                          ),
-                                  ))
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: SizedBox(
-                            height: 30,
-                            child: _mouseDraggable(
-                              context,
-                              Obx(
-                                () => ListView.builder(
-                                  scrollDirection: Axis.horizontal,
-                                  itemCount:
-                                      _scholarController.semesters.length,
-                                  itemBuilder: (context, index) {
-                                    final semester =
-                                        _scholarController.semesters[index];
-                                    return Stack(
-                                      children: [
-                                        Obx(
-                                          () => AnimateButton(
-                                            text:
-                                                '${semester.name.substring(2, 5)}${semester.name.substring(7, 11)}',
-                                            onTap: () {
-                                              _scholarController
-                                                  .semesterIndex.value = index;
-                                              _scholarController.semesterIndex
-                                                  .refresh();
-                                            },
-                                            backgroundColor: _scholarController
-                                                        .semesterIndex.value ==
-                                                    index
-                                                ? CustomCupertinoDynamicColors
-                                                    .cyan
-                                                : CupertinoColors.systemFill,
-                                          ),
-                                        ),
-                                        const SizedBox(width: 90),
-                                      ],
-                                    );
-                                  },
+                        const SizedBox(height: 12),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: SizedBox(
+                                height: 30,
+                                child: _mouseDraggable(
+                                  context,
+                                  Obx(
+                                    () => ListView.builder(
+                                      scrollDirection: Axis.horizontal,
+                                      itemCount:
+                                          _scholarController.semesters.length,
+                                      itemBuilder: (context, index) {
+                                        final semester =
+                                            _scholarController.semesters[index];
+                                        return Stack(
+                                          children: [
+                                            Obx(
+                                              () => AnimateButton(
+                                                text:
+                                                    '${semester.name.substring(2, 5)}${semester.name.substring(7, 11)}',
+                                                onTap: () {
+                                                  _scholarController
+                                                      .semesterIndex
+                                                      .value = index;
+                                                  _scholarController
+                                                      .semesterIndex
+                                                      .refresh();
+                                                },
+                                                backgroundColor: _scholarController
+                                                            .semesterIndex
+                                                            .value ==
+                                                        index
+                                                    ? CustomCupertinoDynamicColors
+                                                        .cyan
+                                                    : CupertinoColors
+                                                        .systemFill,
+                                              ),
+                                            ),
+                                            const SizedBox(width: 90),
+                                          ],
+                                        );
+                                      },
+                                    ),
+                                  ),
                                 ),
                               ),
                             ),
-                          ),
+                          ],
                         ),
-                      ],
-                    ),
-                    // 桌面端刷新超过 5 秒后的状态条：小转圈 + 滚动文案，随刷新结束收起。
-                    // 移动端的状态文案由下方 CupertinoSliverRefreshControl 的 builder 展示
-                    if (PlatformFeatures.isDesktop)
-                      Obx(() {
-                        final message =
-                            _scholarController.refreshStatusMessage.value;
-                        return AnimatedSize(
-                          duration: const Duration(milliseconds: 250),
-                          curve: Curves.easeInOut,
-                          alignment: Alignment.topCenter,
-                          // AnimatedSwitcher 让收起时末条文案先淡出、条带再合拢，
-                          // 而不是内容瞬间消失
-                          child: AnimatedSwitcher(
-                            duration: const Duration(milliseconds: 200),
-                            child: message == null
-                                ? const SizedBox(
-                                    key: ValueKey('refreshStatusStripEmpty'),
-                                    width: double.infinity)
-                                : Padding(
-                                    key: const ValueKey('refreshStatusStrip'),
-                                    padding: const EdgeInsets.only(
-                                        top: 6, bottom: 2),
-                                    child: Row(
-                                      mainAxisAlignment:
-                                          MainAxisAlignment.center,
-                                      children: [
-                                        const CupertinoActivityIndicator(
-                                            radius: 7),
-                                        const SizedBox(width: 6),
-                                        Flexible(
-                                            child: RollingShimmerText(message)),
-                                      ],
-                                    ),
-                                  ),
-                          ),
-                        );
-                      }),
-                    const SizedBox(height: 4),
-                    Divider(
-                      thickness: 0,
-                      color: CupertinoDynamicColor.resolve(
-                          CupertinoColors.separator, context),
-                      height: 14,
-                    ),
-                  ])),
-                    ),
-                  ),
+                        // 桌面端刷新超过 5 秒后的状态条：小转圈 + 滚动文案，随刷新结束收起。
+                        // 移动端的状态文案由下方 CupertinoSliverRefreshControl 的 builder 展示
+                        if (PlatformFeatures.isDesktop)
+                          Obx(() {
+                            final message =
+                                _scholarController.refreshStatusMessage.value;
+                            return AnimatedSize(
+                              duration: const Duration(milliseconds: 250),
+                              curve: Curves.easeInOut,
+                              alignment: Alignment.topCenter,
+                              // AnimatedSwitcher 让收起时末条文案先淡出、条带再合拢，
+                              // 而不是内容瞬间消失
+                              child: AnimatedSwitcher(
+                                duration: const Duration(milliseconds: 200),
+                                child: message == null
+                                    ? const SizedBox(
+                                        key:
+                                            ValueKey('refreshStatusStripEmpty'),
+                                        width: double.infinity)
+                                    : Padding(
+                                        key: const ValueKey(
+                                            'refreshStatusStrip'),
+                                        padding: const EdgeInsets.only(
+                                            top: 6, bottom: 2),
+                                        child: Row(
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.center,
+                                          children: [
+                                            const CupertinoActivityIndicator(
+                                                radius: 7),
+                                            const SizedBox(width: 6),
+                                            Flexible(
+                                                child: RollingShimmerText(
+                                                    message)),
+                                          ],
+                                        ),
+                                      ),
+                              ),
+                            );
+                          }),
+                        const SizedBox(height: 4),
+                        Divider(
+                          thickness: 0,
+                          color: CupertinoDynamicColor.resolve(
+                              CupertinoColors.separator, context),
+                          height: 14,
+                        ),
+                      ])),
+                ),
+              ),
             )),
             if (_scholarController.scholar.isLogan)
               CupertinoSliverRefreshControl(

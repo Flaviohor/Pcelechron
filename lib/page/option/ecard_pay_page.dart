@@ -5,6 +5,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:get/get.dart';
+import 'package:celechron/design/glass.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'package:celechron/design/persistent_headers.dart';
@@ -62,7 +63,8 @@ class ECardPayPage extends StatelessWidget {
         _barcode.value = code;
       }
     });
-    return CupertinoPageScaffold(
+    return AppBackdrop(
+        child: CupertinoPageScaffold(
       backgroundColor: const Color(0x00000000),
       child: SafeArea(
         child: CustomScrollView(
@@ -164,6 +166,6 @@ class ECardPayPage extends StatelessWidget {
           ],
         ),
       ),
-    );
+    ));
   }
 }

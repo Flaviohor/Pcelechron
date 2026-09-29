@@ -3,6 +3,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:celechron/model/course.dart';
 import 'package:celechron/design/round_rectangle_card.dart';
 import 'package:celechron/page/scholar/course_detail/course_detail_view.dart';
+import 'package:celechron/design/glass_route.dart';
 
 class CourseBriefCard extends StatelessWidget {
   final Course course;
@@ -15,7 +16,7 @@ class CourseBriefCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return RoundRectangleCard(
         onTap: allowDirect
-            ? () async => Navigator.of(context).push(CupertinoPageRoute(
+            ? () async => Navigator.of(context).push(GlassPageRoute(
                 builder: (context) => CourseDetailPage(courseId: course.id)))
             : null,
         child: Padding(

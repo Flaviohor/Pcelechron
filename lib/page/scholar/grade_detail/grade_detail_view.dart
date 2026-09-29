@@ -10,6 +10,7 @@ import 'package:celechron/design/persistent_headers.dart';
 import 'grade_card.dart';
 import 'grade_detail_controller.dart';
 import 'package:celechron/utils/gpa_helper.dart';
+import 'package:celechron/design/glass_route.dart';
 import 'weighted_gpa_view.dart';
 
 class GradeDetailPage extends StatelessWidget {
@@ -391,7 +392,7 @@ class GradeDetailPage extends StatelessWidget {
                         ),
                         onPressed: () {
                           Navigator.of(context).push(
-                            CupertinoPageRoute(
+                            GlassPageRoute(
                               builder: (context) => WeightedGpaPage(),
                             ),
                           );

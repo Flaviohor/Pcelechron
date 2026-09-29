@@ -2,6 +2,7 @@ import 'package:celechron/page/scholar/course_detail/course_detail_view.dart';
 import 'package:flutter/cupertino.dart';
 
 import 'package:celechron/model/session.dart';
+import 'package:celechron/design/glass_route.dart';
 
 class SessionCard extends StatefulWidget {
   final List<Session> sessionList;
@@ -89,7 +90,7 @@ class _SessionCardState extends State<SessionCard>
       onTap: () async {
         if (widget.sessionList.length == 1) {
           Navigator.of(context).push(
-            CupertinoPageRoute(
+            GlassPageRoute(
               builder: (context) =>
                   CourseDetailPage(courseId: widget.sessionList[0].id),
               title: widget.sessionList[0].name,
@@ -119,7 +120,7 @@ class _SessionCardState extends State<SessionCard>
                         ),
                         onPressed: () {
                           Navigator.of(context).push(
-                            CupertinoPageRoute(
+                            GlassPageRoute(
                               builder: (context) =>
                                   CourseDetailPage(courseId: s.id),
                               title: s.name,

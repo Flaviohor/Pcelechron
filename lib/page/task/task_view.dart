@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:celechron/model/task.dart';
 import 'package:celechron/model/period.dart';
 import 'package:celechron/utils/platform_features.dart';
+import 'package:celechron/design/glass_route.dart';
 import 'task_edit_page.dart';
 import 'dart:async';
 import 'package:get/get.dart';
@@ -300,7 +301,7 @@ class TaskPage extends StatelessWidget {
             onTap: () async {
               // 直接导航到编辑页面
               Task? res = await Navigator.of(context, rootNavigator: true).push(
-                CupertinoPageRoute(
+                GlassPageRoute(
                   builder: (context) => TaskEditPage(deadline),
                 ),
               );
@@ -316,8 +317,8 @@ class TaskPage extends StatelessWidget {
               // 重新规划
               _flowController.removeFlowInFlowList();
               DateTime now = DateTime.now();
-              DateTime startsAt = DateTime(
-                  now.year, now.month, now.day, now.hour, now.minute);
+              DateTime startsAt =
+                  DateTime(now.year, now.month, now.day, now.hour, now.minute);
               _flowController.generateNewFlowList(startsAt);
               _taskController.taskList.refresh();
             },
@@ -545,7 +546,8 @@ class TaskPage extends StatelessWidget {
           slivers: [
             CupertinoSliverNavigationBar(
               largeTitle: const Text('任务'),
-              backgroundColor: PlatformFeatures.isDesktop ? const Color(0x00000000) : null,
+              backgroundColor:
+                  PlatformFeatures.isDesktop ? const Color(0x00000000) : null,
               border: null,
               stretch: true,
               trailing: // Two buttons in the nav bar.

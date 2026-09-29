@@ -17,6 +17,7 @@ import 'package:celechron/page/scholar/course_detail/course_detail_view.dart';
 import 'package:celechron/page/calendar/schedule_view.dart';
 import 'package:celechron/page/calendar/week_view.dart';
 import 'package:celechron/utils/platform_features.dart';
+import 'package:celechron/design/glass_route.dart';
 import 'calendar_controller.dart';
 
 class CalendarPage extends StatelessWidget {
@@ -375,7 +376,7 @@ class CalendarPage extends StatelessWidget {
   void handlePeriodTap(BuildContext context, Period period) {
     if (period.type == PeriodType.classes || period.type == PeriodType.test) {
       Navigator.of(context, rootNavigator: true).push(
-        CupertinoPageRoute(
+        GlassPageRoute(
             builder: (context) => CourseDetailPage(courseId: period.fromUid)),
       );
     } else if (period.type == PeriodType.user) {

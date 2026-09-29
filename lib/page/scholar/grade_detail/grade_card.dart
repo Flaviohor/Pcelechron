@@ -6,6 +6,7 @@ import 'package:get/get.dart';
 
 import 'package:celechron/model/grade.dart';
 import 'package:celechron/page/scholar/course_detail/course_detail_view.dart';
+import 'package:celechron/design/glass_route.dart';
 
 class GradeCard extends StatefulWidget {
   final Grade grade;
@@ -75,7 +76,7 @@ class _GradeCardState extends State<GradeCard>
         isDown = false;
         if (isCancel) {
           if (!_gradeDetailController.customGpaMode.value) {
-            navigator!.push(CupertinoPageRoute(
+            navigator!.push(GlassPageRoute(
                 builder: (context) =>
                     CourseDetailPage(courseId: widget.grade.id)));
           }
@@ -94,7 +95,7 @@ class _GradeCardState extends State<GradeCard>
         _animationController.forward();
         await Future.delayed(const Duration(milliseconds: 125));
         isDown = false;
-        navigator!.push(CupertinoPageRoute(
+        navigator!.push(GlassPageRoute(
             builder: (context) => CourseDetailPage(courseId: widget.grade.id)));
         _animationController.reverse();
       },

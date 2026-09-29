@@ -19,6 +19,7 @@ import 'login_page.dart';
 import 'option_controller.dart';
 import 'update_sheet.dart';
 import 'package:celechron/services/app_update_service.dart';
+import 'package:celechron/design/glass_route.dart';
 
 const Color _kHeaderFooterColor = CupertinoDynamicColor(
   color: Color.fromRGBO(108, 108, 108, 1.0),
@@ -159,7 +160,7 @@ class OptionPage extends StatelessWidget {
                           trailing: const BackChervonRow(),
                           onTap: () async {
                             Navigator.of(context, rootNavigator: true).push(
-                                CupertinoPageRoute(
+                                GlassPageRoute(
                                     builder: (context) =>
                                         CourseIdMappingEditPage()));
                           },
@@ -382,7 +383,7 @@ class OptionPage extends StatelessWidget {
                                     style: trailingTextStyle))),
                             onTap: () async {
                               await Navigator.of(context, rootNavigator: true)
-                                  .push(CupertinoPageRoute(
+                                  .push(GlassPageRoute(
                                 builder: (context) => const AllowTimeEditPage(),
                               ));
                             },
@@ -521,7 +522,7 @@ class OptionPage extends StatelessWidget {
                     trailing: const BackChervonRow(),
                     onTap: () {
                       Navigator.of(context, rootNavigator: true).push(
-                        CupertinoPageRoute(
+                        GlassPageRoute(
                           builder: (context) => DiagnosticLogPage(
                             version: _optionController.celechronVersion,
                           ),
@@ -560,7 +561,7 @@ class OptionPage extends StatelessWidget {
                       ),
                       onTap: () async {
                         Navigator.of(context, rootNavigator: true).push(
-                            CupertinoPageRoute(
+                            GlassPageRoute(
                                 builder: (context) => CreditsPage(
                                     version:
                                         _optionController.celechronVersion)));
@@ -572,7 +573,7 @@ class OptionPage extends StatelessWidget {
                       trailing: const BackChervonRow(),
                       onTap: () async {
                         Navigator.of(context, rootNavigator: true).push(
-                            CupertinoPageRoute(
+                            GlassPageRoute(
                                 builder: (context) =>
                                     const CustomLicensePage()));
                       },

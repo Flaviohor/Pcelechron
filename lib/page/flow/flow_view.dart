@@ -14,6 +14,7 @@ import 'package:celechron/design/sub_title.dart';
 import 'package:celechron/design/round_rectangle_card.dart';
 import 'package:celechron/page/scholar/course_detail/course_detail_view.dart';
 import 'package:celechron/utils/platform_features.dart';
+import 'package:celechron/design/glass_route.dart';
 import 'flow_controller.dart';
 
 class FlowPage extends StatelessWidget {
@@ -39,7 +40,7 @@ class FlowPage extends StatelessWidget {
         RoundRectangleCard(
           onTap: period.type == PeriodType.classes
               ? () async => Navigator.of(context, rootNavigator: true).push(
-                  CupertinoPageRoute(
+                  GlassPageRoute(
                       builder: (context) =>
                           CourseDetailPage(courseId: period.fromUid)))
               : null,
@@ -287,7 +288,7 @@ class FlowPage extends StatelessWidget {
         RoundRectangleCard(
             onTap: period.type == PeriodType.classes
                 ? () async => Navigator.of(context, rootNavigator: true).push(
-                    CupertinoPageRoute(
+                    GlassPageRoute(
                         builder: (context) =>
                             CourseDetailPage(courseId: period.fromUid)))
                 : null,
@@ -583,7 +584,8 @@ class FlowPage extends StatelessWidget {
             CupertinoSliverNavigationBar(
               largeTitle: const Text('接下来'),
               stretch: true,
-              backgroundColor: PlatformFeatures.isDesktop ? const Color(0x00000000) : null,
+              backgroundColor:
+                  PlatformFeatures.isDesktop ? const Color(0x00000000) : null,
               border: null,
               trailing: // Two buttons in the nav bar.
                   Row(
