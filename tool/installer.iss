@@ -98,7 +98,10 @@ ArchitecturesAllowed={#ArchAllowed}
 ArchitecturesInstallIn64BitMode={#Arch64Mode}
 #endif
 MinVersion=10.0.17763
-CloseApplications=yes
+; 不用 Inno 的 Restart Manager 关应用：托盘常驻的应用(隐藏窗口)会让
+; 文件占用检测与关闭等待在「准备安装」页长时间卡死。改为 [Code] 段里
+; PrepareToInstall / InitializeUninstall 自己确定性地产判并 taskkill。
+CloseApplications=no
 RestartApplications=no
 AllowNoIcons=yes
 SetupLogging=yes
@@ -155,8 +158,83 @@ Filename: "{app}\{#AppExeName}"; Description: "立即运行 {#AppName}"; \
   Flags: nowait postinstall skipifsilent
 
 [Code]
+const
+  // 同时覆盖旧版本镜像名 Celechron.exe（1.3.2 及更早）；
+  // 'CELECHRON' 是 'PCELECHRON' 的子串，检测一次即可同时命中两者。
+  AppImageNameOld = 'Celechron.exe';
+  AppImageName = 'PCelechron.exe';
+
 var
   RemoveDataPage: TInputOptionWizardPage;
+
+function IsAppRunning(): Boolean;
+var
+  ResultCode: Integer;
+  TempFile: String;
+  ListContent: String;
+begin
+  Result := False;
+  TempFile := ExpandConstant('{temp}\pcelechron_proclist.txt');
+  Exec(ExpandConstant('{sys}\cmd.exe'),
+    '/C tasklist /NH /FO CSV | findstr /I "celechron" > "' + TempFile + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if LoadStringFromFile(TempFile, ListContent) then
+  begin
+    if Pos(UpperCase('celechron'), UpperCase(ListContent)) > 0 then
+      Result := True;
+    DeleteFile(TempFile);
+  end;
+end;
+
+function StopAppIfNeeded(const ForUninstall: Boolean): Boolean;
+var
+  ActionName: String;
+  ResultCode: Integer;
+  I: Integer;
+begin
+  Result := True;
+  if not IsAppRunning() then Exit;
+
+  if ForUninstall then
+    ActionName := '卸载'
+  else
+    ActionName := '安装';
+
+  if MsgBox('检测到 PCelechron 正在运行（可能在系统托盘中）。' + #13#10 +
+            '继续' + ActionName + '将自动关闭它，是否继续？',
+            mbConfirmation, MB_OKCANCEL) = IDCANCEL then
+  begin
+    Result := False;
+    Exit;
+  end;
+
+  // 强杀是安全的：Hive 为追加写，应用启动时还会清理陈旧 .lock 文件。
+  Exec(ExpandConstant('{sys}\taskkill.exe'),
+    '/F /T /IM "' + AppImageName + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'),
+    '/F /T /IM "' + AppImageNameOld + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  // 最多等 10 秒确认进程退出，避免文件占用导致复制阶段报错。
+  for I := 1 to 20 do
+  begin
+    if not IsAppRunning() then Break;
+    Sleep(500);
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  if not StopAppIfNeeded(False) then
+    Result := '安装已取消。';
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  Result := StopAppIfNeeded(True);
+end;
 
 procedure InitializeWizard();
 begin
