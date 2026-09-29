@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter/cupertino.dart';
 
 import 'package:celechron/design/glass.dart';
@@ -68,9 +66,6 @@ class _RoundRectangleCardState extends State<RoundRectangleCard>
     final brightness = CupertinoTheme.of(context).brightness ??
         MediaQuery.of(context).platformBrightness;
     final bool isDark = brightness == Brightness.dark;
-    var isDown = false;
-    var isCancel = false;
-
     // 桌面端把卡片做成液态玻璃：不再用不透明的 secondarySystemBackground，
     // 改成半透明 tint + 背景模糊，让窗口底色里的色斑与随指针走的柔光透上来。
     // 移动端保持原来的实心卡片（玻璃是桌面端专属的观感处理）。
@@ -102,30 +97,17 @@ class _RoundRectangleCardState extends State<RoundRectangleCard>
           child: widget.child);
     }
 
-    return widget.animate
-        ? GestureDetector(
-            onTapDown: (_) async {
-              isDown = true;
-              isCancel = false;
-              _animationController.forward();
-              await Future.delayed(const Duration(milliseconds: 125));
-              isDown = false;
-              if (isCancel) {
-                if (widget.onTap != null) {
-                  widget.onTap?.call();
-                }
-                _animationController.reverse();
-                isCancel = false;
-              }
-            },
-            onTapUp: (_) async {
-              isCancel = true;
-              if (!isDown) _animationController.reverse();
-            },
-            onTapCancel: () async => _animationController.reverse(),
-            child: ScaleTransition(scale: _scaleAnimation, child: core),
-          )
-        : GestureDetector(onTap: widget.onTap, child: core);
+    // 触发与动画分离：onTap 在松手时必触发（鼠标按住时长普遍超过旧实现的
+    // 125ms 定时窗，导致鼠标点击永远不触发），按压动画只负责缩放观感。
+    return GestureDetector(
+      onTap: widget.onTap,
+      onTapDown: widget.animate ? (_) => _animationController.forward() : null,
+      onTapUp: widget.animate ? (_) => _animationController.reverse() : null,
+      onTapCancel: widget.animate ? () => _animationController.reverse() : null,
+      child: widget.animate
+          ? ScaleTransition(scale: _scaleAnimation, child: core)
+          : core,
+    );
   }
 }
 
