@@ -99,10 +99,7 @@ class PracticeScorePage extends StatelessWidget {
       navigationBar: CupertinoNavigationBar(
         middle: Text('$_categoryName项目'),
       ),
-      backgroundColor: CupertinoDynamicColor.resolve(
-        CupertinoColors.systemGroupedBackground,
-        context,
-      ),
+      backgroundColor: const Color(0x00000000),
       child: SafeArea(
         child: ListView(
           padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
@@ -189,10 +186,7 @@ class PracticeScoreDetailPage extends StatelessWidget {
     ];
     return CupertinoPageScaffold(
       navigationBar: const CupertinoNavigationBar(middle: Text('实践项目详情')),
-      backgroundColor: CupertinoDynamicColor.resolve(
-        CupertinoColors.systemGroupedBackground,
-        context,
-      ),
+      backgroundColor: const Color(0x00000000),
       child: SafeArea(
         child: ListView(
           padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),

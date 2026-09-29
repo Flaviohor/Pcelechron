@@ -325,8 +325,7 @@ class _ExamListPageState extends State<ExamListPage> {
   @override
   Widget build(BuildContext context) {
     return CupertinoPageScaffold(
-      backgroundColor: CupertinoDynamicColor.resolve(
-          CupertinoColors.systemGroupedBackground, context),
+      backgroundColor: const Color(0x00000000),
       child: CustomScrollView(
         slivers: [
           const CelechronSliverTextHeader(

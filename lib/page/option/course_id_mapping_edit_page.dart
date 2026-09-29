@@ -174,7 +174,7 @@ class CourseIdMappingEditPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return CupertinoPageScaffold(
-      backgroundColor: CupertinoColors.systemGroupedBackground,
+      backgroundColor: const Color(0x00000000),
       child: SafeArea(
         child: CustomScrollView(
           slivers: [

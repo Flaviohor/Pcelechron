@@ -272,7 +272,7 @@ class _AllowTimeEditPageState extends State<AllowTimeEditPage> {
     now.removeWhere((element) => element.isDeleted);
 
     return CupertinoPageScaffold(
-      backgroundColor: CupertinoColors.systemGroupedBackground,
+      backgroundColor: const Color(0x00000000),
       child: SafeArea(
         child: CustomScrollView(
           slivers: [

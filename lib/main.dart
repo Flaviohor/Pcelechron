@@ -17,6 +17,7 @@ import 'package:celechron/services/refresh_coordinator.dart';
 import 'package:celechron/worker/ecard_widget_messenger.dart';
 import 'package:celechron/database/database_helper.dart';
 import 'package:celechron/database/hive_paths.dart';
+import 'package:celechron/design/glass.dart';
 import 'package:celechron/services/app_update_service.dart';
 import 'package:celechron/services/desktop_tray_service.dart';
 import 'package:celechron/utils/global.dart';
@@ -242,7 +243,9 @@ class _CelechronAppState extends State<CelechronApp>
               child: MediaQuery(
                 data: MediaQuery.of(context)
                     .copyWith(alwaysUse24HourFormat: true),
-                child: child!,
+                // AppBackdrop 提到 App 级：二级页面与弹层同样落在环境光背景上，
+                // 配合各页透明脚手架实现「所有界面一致的液态玻璃」。
+                child: AppBackdrop(child: child!),
               ),
             );
           },

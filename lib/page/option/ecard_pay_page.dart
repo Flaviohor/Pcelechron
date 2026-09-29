@@ -63,6 +63,7 @@ class ECardPayPage extends StatelessWidget {
       }
     });
     return CupertinoPageScaffold(
+      backgroundColor: const Color(0x00000000),
       child: SafeArea(
         child: CustomScrollView(
           slivers: [

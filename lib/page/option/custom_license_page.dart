@@ -8,6 +8,7 @@ class CustomLicensePage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return CupertinoPageScaffold(
+      backgroundColor: const Color(0x00000000),
       child: SafeArea(
         child: CustomScrollView(
           slivers: [

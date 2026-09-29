@@ -155,6 +155,7 @@ class _DiagnosticLogPageState extends State<DiagnosticLogPage> {
   @override
   Widget build(BuildContext context) {
     return CupertinoPageScaffold(
+      backgroundColor: const Color(0x00000000),
       navigationBar: const CupertinoNavigationBar(
         middle: Text('诊断与测试'),
       ),

@@ -11,8 +11,8 @@ import 'package:celechron/page/calendar/calendar_view.dart';
 import 'package:celechron/page/option/option_view.dart';
 
 import 'package:celechron/worker/fuse.dart';
-import 'package:celechron/utils/platform_features.dart';
 import 'package:celechron/design/glass.dart';
+import 'package:celechron/utils/platform_features.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key, required this.title});
@@ -55,10 +55,7 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     final useSidebar = PlatformFeatures.isDesktop &&
         MediaQuery.of(context).size.width >= desktopBreakpoint;
-    return AppBackdrop(
-      child:
-          useSidebar ? _buildSidebarLayout(context) : _buildTabLayout(context),
-    );
+    return useSidebar ? _buildSidebarLayout(context) : _buildTabLayout(context);
   }
 
   /// 桌面宽屏布局：悬浮侧栏胶囊 + 内容区。

@@ -150,8 +150,7 @@ class WeightedGpaPage extends StatelessWidget {
       affectGpaGrades.sort((a, b) => a.name.compareTo(b.name));
 
       return CupertinoPageScaffold(
-        backgroundColor: CupertinoDynamicColor.resolve(
-            CupertinoColors.systemGroupedBackground, context),
+        backgroundColor: const Color(0x00000000),
         child: CustomScrollView(
           slivers: [
             CelechronSliverTextHeader(
