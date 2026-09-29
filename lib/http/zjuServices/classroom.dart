@@ -47,7 +47,7 @@ class ClassroomService {
   static const _tenantId = '112';
 
   static _ClassroomSession? _session;
-  static final Map<String, ClassroomCourse?> _matchCache = {};
+  static final Map<String, ClassroomMatch?> _matchCache = {};
 
   /// 与统一认证共享的客户端：让 ZjuAm 的 SSO cookie 缓存按账号生效。
   static final HttpClient _sharedClient = HttpClient();
@@ -77,8 +77,12 @@ class ClassroomService {
     _matchCache.clear();
   }
 
-  /// 在智云课堂里找与本课程匹配的条目。未登录/网络失败抛异常，调用方兜底。
-  static Future<ClassroomCourse?> findCourse({
+  /// 在智云课堂里解析本课程：匹配 + 子节（课时）数。
+  ///
+  /// 返回 null 的三种情况调用方都应视为「不展示卡片」：没搜到对应课程、
+  /// 课程还没有任何子节（尚未上课 / 回放未生成）、查找过程失败（如不在
+  /// 校园网）。子节数经 get-course-detail 确认，避免给用户一个空页面。
+  static Future<ClassroomMatch?> resolveCourse({
     required String courseName,
     String? teacher,
     required String? username,
@@ -91,8 +95,58 @@ class ClassroomService {
         await _ensureSession(username: username, password: password);
     final candidates = await _searchCourses(session, courseName, teacher);
     final best = _pickBest(candidates, courseName, teacher);
-    _matchCache[cacheKey] = best;
-    return best;
+    if (best == null) {
+      _matchCache[cacheKey] = null;
+      return null;
+    }
+    final subCount = await _countSubs(session, best.courseId);
+    final match = subCount == null
+        ? null
+        : ClassroomMatch(course: best, subCount: subCount);
+    _matchCache[cacheKey] = match;
+    return match;
+  }
+
+  /// get-course-detail 的 sub_list 是 年→月→周→子节 的嵌套结构，
+  /// 递归数出所有带 id 的子节对象；接口失败返回 null（与 0 区分开）。
+  static Future<int?> _countSubs(
+      _ClassroomSession session, int courseId) async {
+    final uri = Uri.parse(
+            'https://yjapi.cmc.zju.edu.cn/courseapi/v3/multi-search/get-course-detail')
+        .replace(queryParameters: {
+      'course_id': '$courseId',
+      'student': session.account,
+    });
+    final request = await session.httpClient.openUrl('GET', uri);
+    request.headers.set('User-Agent', _userAgent);
+    request.headers.set('Authorization', 'Bearer ${session.token}');
+    final response = await request.close().timeout(
+          const Duration(seconds: 8),
+          onTimeout: () => throw requestTimeout(),
+        );
+    final body = await response.transform(utf8.decoder).join();
+    final payload = decodeJsonMap(body, context: '智云课堂课程详情');
+    if (asInt(payload['code']) != null && asInt(payload['code']) != 0) {
+      throw ExceptionWithMessage('智云课堂课程详情失败：${asString(payload['msg'])}');
+    }
+    final data = asStringMap(payload['data']);
+    if (data == null) return 0;
+    return _countSubNodes(data['sub_list']);
+  }
+
+  static int _countSubNodes(Object? node) {
+    if (node is Map) {
+      if (node.containsKey('id') && node.containsKey('sub_title')) return 1;
+      var total = 0;
+      for (final value in node.values) {
+        total += _countSubNodes(value);
+      }
+      return total;
+    }
+    if (node is List) {
+      return node.fold(0, (sum, item) => sum + _countSubNodes(item));
+    }
+    return 0;
   }
 
   // ===== 登录 =====
@@ -341,6 +395,14 @@ class ClassroomService {
     if (value is num) return value.toInt();
     return int.tryParse(value?.toString().trim() ?? '');
   }
+}
+
+/// 一次成功解析的智云课堂课程：匹配条目 + 子节（课时/回放）数。
+class ClassroomMatch {
+  final ClassroomCourse course;
+  final int subCount;
+
+  const ClassroomMatch({required this.course, required this.subCount});
 }
 
 class ClassroomCourse {
