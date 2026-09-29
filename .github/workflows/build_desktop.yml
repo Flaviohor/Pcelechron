@@ -505,8 +505,8 @@ jobs:
           if [ -n "${{ github.event.inputs.version }}" ]; then
             v="${{ github.event.inputs.version }}"
             echo "version from workflow input override: $v"
-          elif [[ "${{ github.ref_name }}" == v* ]]; then
-            v="${{ github.ref_name#v }}"
+          elif [[ "$GITHUB_REF_NAME" == v* ]]; then
+            v="${GITHUB_REF_NAME#v}"
             echo "version from tag: $v"
           else
             git clone --depth 1 --branch "${{ github.ref_name }}" "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" repo 2>/dev/null || true
