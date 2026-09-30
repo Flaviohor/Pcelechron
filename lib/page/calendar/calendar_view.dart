@@ -5,8 +5,6 @@ import 'package:celechron/page/task/task_controller.dart';
 import 'package:celechron/page/task/task_edit_page.dart';
 import 'package:celechron/page/flow/flow_controller.dart';
 import 'package:flutter/cupertino.dart';
-import 'package:flutter/gestures.dart'
-    show DragEndDetails, PointerDeviceKind, VerticalDragGestureRecognizer;
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:table_calendar/table_calendar.dart';
@@ -126,108 +124,107 @@ class CalendarPage extends StatelessWidget {
                   return Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // 月/周收展：TableCalendar 自带的竖向滑动不含鼠标设备，
-                      // 外面再包一层支持鼠标的竖向拖拽；触摸时内层优先，行为不变。
-                      // 上滑收起为周视图，下滑展开为月视图。
-                      RawGestureDetector(
-                        gestures: {
-                          VerticalDragGestureRecognizer:
-                              GestureRecognizerFactoryWithHandlers<
-                                  VerticalDragGestureRecognizer>(
-                            () => VerticalDragGestureRecognizer(
-                                supportedDevices: const {
-                                  PointerDeviceKind.touch,
-                                  PointerDeviceKind.mouse,
-                                  PointerDeviceKind.stylus,
-                                  PointerDeviceKind.trackpad,
-                                }),
-                            (instance) {
-                              instance.onEnd = _onCalendarVerticalDragEnd;
-                            },
+                      Padding(
+                        padding: const EdgeInsets.only(
+                            bottom: 5, left: 12, right: 12),
+                        child: TableCalendar(
+                          locale: 'zh_CN',
+                          firstDay: DateTime.utc(2022, 9, 1),
+                          lastDay: DateTime.utc(2030, 12, 31),
+                          rowHeight: 48.0,
+                          daysOfWeekHeight: 20.0,
+                          startingDayOfWeek: StartingDayOfWeek.monday,
+                          daysOfWeekStyle: DaysOfWeekStyle(
+                            dowTextFormatter: (date, locale) => <String>[
+                              '',
+                              '一',
+                              '二',
+                              '三',
+                              '四',
+                              '五',
+                              '六',
+                              '日'
+                            ][date.weekday],
                           ),
-                        },
-                        child: Padding(
-                          padding: const EdgeInsets.only(
-                              bottom: 5, left: 12, right: 12),
-                          child: TableCalendar(
-                            locale: 'zh_CN',
-                            firstDay: DateTime.utc(2022, 9, 1),
-                            lastDay: DateTime.utc(2030, 12, 31),
-                            rowHeight: 48.0,
-                            daysOfWeekHeight: 20.0,
-                            startingDayOfWeek: StartingDayOfWeek.monday,
-                            daysOfWeekStyle: DaysOfWeekStyle(
-                              dowTextFormatter: (date, locale) => <String>[
-                                '',
-                                '一',
-                                '二',
-                                '三',
-                                '四',
-                                '五',
-                                '六',
-                                '日'
-                              ][date.weekday],
+                          availableGestures: AvailableGestures.all,
+                          availableCalendarFormats: const {
+                            CalendarFormat.month: '显示整月',
+                            CalendarFormat.week: '显示一周',
+                          },
+                          headerVisible: false,
+                          focusedDay: _calendarController.focusedDay.value,
+                          selectedDayPredicate: (day) {
+                            return isSameDay(
+                                _calendarController.selectedDay.value, day);
+                          },
+                          calendarFormat:
+                              _calendarController.calendarFormat.value,
+                          onPageChanged: (focusedDay) {
+                            _calendarController.focusedDay.value = focusedDay;
+                          },
+                          onDaySelected: (selectedDay, focusedDay) {
+                            _calendarController.focusedDay.value = focusedDay;
+                            _calendarController.selectedDay.value = selectedDay;
+                            _calendarController.focusedDay.refresh();
+                          },
+                          onFormatChanged: (format) {
+                            _calendarController.calendarFormat.value = format;
+                          },
+                          eventLoader: (day) {
+                            return _calendarController.getEventsForDay(day);
+                          },
+                          calendarStyle: CalendarStyle(
+                            markersAnchor: -0.1,
+                            markersMaxCount: 10,
+                            selectedDecoration: BoxDecoration(
+                              color: CupertinoDynamicColor.resolve(
+                                  CupertinoColors.activeBlue
+                                      .withValues(alpha: 0.5),
+                                  context),
+                              shape: BoxShape.circle,
                             ),
-                            availableGestures: AvailableGestures.all,
-                            availableCalendarFormats: const {
-                              CalendarFormat.month: '显示整月',
-                              CalendarFormat.week: '显示一周',
-                            },
-                            headerVisible: false,
-                            focusedDay: _calendarController.focusedDay.value,
-                            selectedDayPredicate: (day) {
-                              return isSameDay(
-                                  _calendarController.selectedDay.value, day);
-                            },
-                            calendarFormat:
-                                _calendarController.calendarFormat.value,
-                            onPageChanged: (focusedDay) {
-                              _calendarController.focusedDay.value = focusedDay;
-                            },
-                            onDaySelected: (selectedDay, focusedDay) {
-                              _calendarController.focusedDay.value = focusedDay;
-                              _calendarController.selectedDay.value =
-                                  selectedDay;
-                              _calendarController.focusedDay.refresh();
-                            },
-                            onFormatChanged: (format) {
-                              _calendarController.calendarFormat.value = format;
-                            },
-                            eventLoader: (day) {
-                              return _calendarController.getEventsForDay(day);
-                            },
-                            calendarStyle: CalendarStyle(
-                              markersAnchor: -0.1,
-                              markersMaxCount: 10,
-                              selectedDecoration: BoxDecoration(
-                                color: CupertinoDynamicColor.resolve(
-                                    CupertinoColors.activeBlue
-                                        .withValues(alpha: 0.5),
-                                    context),
-                                shape: BoxShape.circle,
-                              ),
-                              selectedTextStyle: CupertinoTheme.of(context)
-                                  .textTheme
-                                  .textStyle,
-                              todayDecoration: BoxDecoration(
-                                color: CupertinoDynamicColor.resolve(
-                                    CupertinoColors.inactiveGray
-                                        .withValues(alpha: 0.5),
-                                    context),
-                                shape: BoxShape.circle,
-                              ),
-                              todayTextStyle: CupertinoTheme.of(context)
-                                  .textTheme
-                                  .textStyle,
-                              defaultTextStyle: CupertinoTheme.of(context)
-                                  .textTheme
-                                  .textStyle,
+                            selectedTextStyle:
+                                CupertinoTheme.of(context).textTheme.textStyle,
+                            todayDecoration: BoxDecoration(
+                              color: CupertinoDynamicColor.resolve(
+                                  CupertinoColors.inactiveGray
+                                      .withValues(alpha: 0.5),
+                                  context),
+                              shape: BoxShape.circle,
                             ),
-                            calendarBuilders: const CalendarBuilders(
-                              singleMarkerBuilder: singleMarkerBuilder,
-                            ),
+                            todayTextStyle:
+                                CupertinoTheme.of(context).textTheme.textStyle,
+                            defaultTextStyle:
+                                CupertinoTheme.of(context).textTheme.textStyle,
+                          ),
+                          calendarBuilders: const CalendarBuilders(
+                            singleMarkerBuilder: singleMarkerBuilder,
                           ),
                         ),
+                      ),
+                      // 月/周收展按钮：竖向滑动手势在桌面端不可靠，改为显式图标。
+                      // 月视图时显示向上箭头（点击收起为周），周视图显示向下（展开为月）。
+                      Center(
+                        child: Obx(() => CupertinoButton(
+                              padding: const EdgeInsets.symmetric(vertical: 2),
+                              minimumSize: const Size(36, 24),
+                              child: Icon(
+                                _calendarController.calendarFormat.value ==
+                                        CalendarFormat.month
+                                    ? CupertinoIcons.chevron_up
+                                    : CupertinoIcons.chevron_down,
+                                size: 18,
+                                color: CupertinoDynamicColor.resolve(
+                                    CupertinoColors.secondaryLabel, context),
+                              ),
+                              onPressed: () {
+                                _calendarController.calendarFormat.value =
+                                    _calendarController.calendarFormat.value ==
+                                            CalendarFormat.month
+                                        ? CalendarFormat.week
+                                        : CalendarFormat.month;
+                              },
+                            )),
                       ),
                       const SizedBox(height: 16),
                       Obx(
@@ -287,21 +284,6 @@ class CalendarPage extends StatelessWidget {
         ),
       ),
     );
-  }
-
-  /// 月历的竖向收展：上滑（速度向上超过阈值）收起为周视图，下滑展开为月视图。
-  void _onCalendarVerticalDragEnd(DragEndDetails details) {
-    final dy = details.velocity.pixelsPerSecond.dy;
-    const threshold = 200.0;
-    if (dy < -threshold) {
-      if (_calendarController.calendarFormat.value != CalendarFormat.week) {
-        _calendarController.calendarFormat.value = CalendarFormat.week;
-      }
-    } else if (dy > threshold) {
-      if (_calendarController.calendarFormat.value != CalendarFormat.month) {
-        _calendarController.calendarFormat.value = CalendarFormat.month;
-      }
-    }
   }
 
   Future<void> newDeadline(context, {required DateTime time}) async {

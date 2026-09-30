@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:celechron/http/zjuServices/exceptions.dart';
+import 'package:celechron/services/diagnostic_log_service.dart';
 import 'package:celechron/http/zjuServices/zjuam.dart';
 import 'package:celechron/http/zjuServices/response_utils.dart';
 
@@ -140,6 +141,14 @@ class ClassroomService {
       }
     }
 
+    DiagnosticLogService.instance.record(
+      module: 'classroom',
+      operation: 'match',
+      message: subIds.isEmpty
+          ? '我的课程共 ${lessons.length} 节，无「$courseName」的匹配'
+          : '我的课程共 ${lessons.length} 节，「$courseName」命中 '
+              '${subIds.length} 节（course_id=$latestCourseId）',
+    );
     if (latestCourseId == null || latestSubId == null || subIds.isEmpty) {
       _matchCache[cacheKey] = null;
       return null;
@@ -482,10 +491,18 @@ class _CookieJar {
 
   /// 取某域下的 `_token` cookie：先原样、再百分号解码、再 PHP 序列化兜底。
   String? tokenFor(String host) {
-    final cookies = _store[host];
-    if (cookies == null) return null;
-    final raw = cookies['_token'];
-    if (raw == null || raw.isEmpty) return null;
+    // cookie 可能带 Domain=.zju.edu.cn / .cmc.zju.edu.cn 属性，归档键
+    // 不一定是 host 本身：host 及其父域都找一遍。
+    String? raw;
+    for (final entry in _store.entries) {
+      if (raw != null) break;
+      final domain = entry.key;
+      if (host == domain || host.endsWith('.$domain')) {
+        final value = entry.value['_token'];
+        if (value != null && value.isNotEmpty) raw = value;
+      }
+    }
+    if (raw == null) return null;
     final candidates = <String>[raw];
     try {
       candidates.add(Uri.decodeComponent(raw));
