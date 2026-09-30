@@ -2,10 +2,12 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:celechron/database/database_helper.dart';
 import 'package:celechron/http/zjuServices/exceptions.dart';
 import 'package:celechron/http/zjuServices/response_utils.dart';
 import 'package:celechron/http/zjuServices/zjuam.dart';
 import 'package:celechron/services/diagnostic_log_service.dart';
+import 'package:get/get.dart';
 
 /// 智云课堂（classroom.zju.edu.cn）客户端：CAS 换 token + 「我的课程」匹配。
 ///
@@ -20,7 +22,7 @@ import 'package:celechron/services/diagnostic_log_service.dart';
 ///
 /// 注意：不要走 tgmedia 的 PHP SSO 链——实测会中转到通行证(zuinfo)页面
 /// 卡死，且智云有官方 CAS 回调，service 票据直换 token 更短更稳。
-/// Token 失效（401）时清除会话重登一次再重放请求。
+/// Token 持久化在 dbOptions，401 时清掉重登（经验文档一.2）。
 ///
 /// ## 课程匹配：从「我的课程」入手 + 核心课名分层匹配
 ///
@@ -49,34 +51,64 @@ class ClassroomService {
   static const _myCourseMonthUrl =
       'https://classroom.zju.edu.cn/courseapi/v2/course-live/get-my-course-month';
 
+  /// Token 持久化 key（经验文档一.2：Token 有效期较长，内存 + 本地双缓存，
+  /// 只有 401 才重登）。存 originalWebPageBox，退出登录清缓存时一并清掉。
+  static const _tokenCacheKey = 'classroom_bearer_token';
+
   static _ClassroomSession? _session;
   static final Map<String, ClassroomMatch?> _matchCache = {};
 
   /// 与统一认证共享的客户端：让 ZjuAm 的 SSO cookie 缓存按账号生效。
   static final HttpClient _sharedClient = HttpClient();
 
-  /// 登录（进程内缓存会话）。
+  static DatabaseHelper? get _db {
+    try {
+      return Get.find<DatabaseHelper>(tag: 'db');
+    } on Object {
+      return null;
+    }
+  }
+
+  /// 登录（内存 + 持久化双层缓存）。
   static Future<_ClassroomSession> _ensureSession({
     required String? username,
     required String? password,
   }) async {
     final current = _session;
     if (current != null) return current;
+
+    final cachedToken = _db?.getCachedWebPage(_tokenCacheKey) ?? '';
+    if (cachedToken.isNotEmpty) {
+      final session =
+          _ClassroomSession(httpClient: _sharedClient, token: cachedToken);
+      _session = session;
+      return session;
+    }
+
     if (username == null ||
         username.isEmpty ||
         password == null ||
         password.isEmpty) {
       throw ExceptionWithMessage('未登录，无法访问智云课堂');
     }
-    final iPlanetCookie =
-        await ZjuAm.getSsoCookie(_sharedClient, username, password);
-    final session = await _login(iPlanetCookie);
+    final session = await _login(username, password);
+    _db?.setCachedWebPage(_tokenCacheKey, session.token);
     _session = session;
     return session;
   }
 
-  static void clearSession() {
+  /// 清空内存会话与持久化 token（401 时调用；退出登录也会随缓存清理）。
+  static void _forgetToken() {
     _session = null;
+    try {
+      unawaited(_db?.setCachedWebPage(_tokenCacheKey, ''));
+    } on Object {
+      // 持久化失败不影响内存会话重建。
+    }
+  }
+
+  static void clearSession() {
+    _forgetToken();
     _matchCache.clear();
   }
 
@@ -106,7 +138,7 @@ class ClassroomService {
     var lessons = await _fetchMyLessons(session);
     if (lessons == null) {
       // 401：token 失效，重登一次再试（经验文档「Token 失效自动刷新」）。
-      _session = null;
+      _forgetToken();
       session = await _ensureSession(username: username, password: password);
       lessons = await _fetchMyLessons(session) ?? const <ClassroomLesson>[];
     }
@@ -254,7 +286,10 @@ class ClassroomService {
 
   // ===== 登录：CAS service 票据直换智云 token =====
 
-  static Future<_ClassroomSession> _login(Cookie? iPlanetCookie) async {
+  static Future<_ClassroomSession> _login(
+      String username, String password) async {
+    var iPlanetCookie =
+        await ZjuAm.getSsoCookie(_sharedClient, username, password);
     if (iPlanetCookie == null) {
       throw ExceptionWithMessage('统一认证未登录，无法访问智云课堂');
     }
@@ -262,68 +297,96 @@ class ClassroomService {
     try {
       final service = Uri.encodeComponent(_classroomCasCallback);
       final casUri = Uri.parse('$_casLoginUrl?service=$service');
-      final casRequest = await httpClient.openUrl('GET', casUri).timeout(
-            const Duration(seconds: 8),
-            onTimeout: () => throw requestTimeout(),
-          );
-      casRequest.followRedirects = false;
-      casRequest.headers.set('User-Agent', _userAgent);
-      casRequest.cookies.add(Cookie(iPlanetCookie.name, iPlanetCookie.value));
-      final casResponse = await casRequest.close().timeout(
-            const Duration(seconds: 8),
-            onTimeout: () => throw requestTimeout(),
-          );
-      await casResponse.drain<void>();
 
-      final location = casResponse.headers.value(HttpHeaders.locationHeader);
-      if (casResponse.statusCode != HttpStatus.movedTemporarily ||
-          location == null ||
-          !location.contains('ticket=')) {
-        // iPlanet 失效时 CAS 返回登录页（200）而非 302 带票跳转。
+      // CAS 返回 200（登录页）而非 302 带票，说明 iPlanet 已失效：
+      // 清掉统一认证缓存强制重登一次再试；仍失败则把页面摘要写进日志。
+      for (var attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) {
+          iPlanetCookie =
+              await ZjuAm.getSsoCookie(_sharedClient, username, password);
+          if (iPlanetCookie == null) {
+            throw ExceptionWithMessage('统一认证重登失败');
+          }
+        }
+        final cookie = iPlanetCookie!;
+        final casRequest = await httpClient.openUrl('GET', casUri).timeout(
+              const Duration(seconds: 8),
+              onTimeout: () => throw requestTimeout(),
+            );
+        casRequest.followRedirects = false;
+        casRequest.headers.set('User-Agent', _userAgent);
+        casRequest.cookies.add(Cookie(cookie.name, cookie.value));
+        final casResponse = await casRequest.close().timeout(
+              const Duration(seconds: 8),
+              onTimeout: () => throw requestTimeout(),
+            );
+        final location = casResponse.headers.value(HttpHeaders.locationHeader);
+        if (casResponse.statusCode == HttpStatus.movedTemporarily &&
+            location != null &&
+            location.contains('ticket=')) {
+          return await _exchangeToken(httpClient, location);
+        }
+        if (attempt == 0) {
+          // 第一次失败：作废缓存的统一认证会话，下一次强制重新登录。
+          await ZjuAm.clearCachedSsoCookie(username);
+          continue;
+        }
+        final summary = await responseSummaryOf(casResponse);
         throw ExceptionWithMessage(
           '统一认证会话无效，未能取得智云课堂票据',
           details: 'CAS 状态 ${casResponse.statusCode}，'
-              'Location=${location ?? '<无>'}',
+              'Location=${location ?? '<无>'}；$summary',
         );
       }
-
-      // 跟随回调（可能再有一跳），最终应返回含 token 的 JSON。
-      var callbackUrl = Uri.parse(location);
-      String body = '';
-      for (var hop = 0; hop < 5; hop++) {
-        final request = await httpClient.openUrl('GET', callbackUrl).timeout(
-              const Duration(seconds: 8),
-              onTimeout: () => throw requestTimeout(),
-            );
-        request.followRedirects = hop < 4;
-        request.headers.set('User-Agent', _userAgent);
-        final response = await request.close().timeout(
-              const Duration(seconds: 8),
-              onTimeout: () => throw requestTimeout(),
-            );
-        body = await response.transform(utf8.decoder).join();
-        final next = response.headers.value(HttpHeaders.locationHeader);
-        if (next != null && next.isNotEmpty) {
-          callbackUrl = callbackUrl.resolve(next);
-          continue;
-        }
-        break;
-      }
-
-      final payload = decodeJsonMap(body, context: '智云课堂 CAS 回调');
-      final data = asStringMap(payload['data']);
-      final token = (asString(data?['token']) ?? '').trim();
-      if (token.isEmpty) {
-        throw ExceptionWithMessage(
-          '智云课堂 CAS 回调未下发 token',
-          details: body.length > 300 ? body.substring(0, 300) : body,
-        );
-      }
-      return _ClassroomSession(httpClient: httpClient, token: token);
+      throw ExceptionWithMessage('未能取得智云课堂票据');
     } on Object {
       httpClient.close();
       rethrow;
     }
+  }
+
+  /// 跟随回调（可能再有一跳），最终应返回含 token 的 JSON。
+  static Future<_ClassroomSession> _exchangeToken(
+      HttpClient httpClient, String callbackUrl) async {
+    var url = Uri.parse(callbackUrl);
+    String body = '';
+    for (var hop = 0; hop < 5; hop++) {
+      final request = await httpClient.openUrl('GET', url).timeout(
+            const Duration(seconds: 8),
+            onTimeout: () => throw requestTimeout(),
+          );
+      request.followRedirects = hop < 4;
+      request.headers.set('User-Agent', _userAgent);
+      final response = await request.close().timeout(
+            const Duration(seconds: 8),
+            onTimeout: () => throw requestTimeout(),
+          );
+      body = await response.transform(utf8.decoder).join();
+      final next = response.headers.value(HttpHeaders.locationHeader);
+      if (next != null && next.isNotEmpty) {
+        url = url.resolve(next);
+        continue;
+      }
+      break;
+    }
+
+    final payload = decodeJsonMap(body, context: '智云课堂 CAS 回调');
+    final data = asStringMap(payload['data']);
+    final token = (asString(data?['token']) ?? '').trim();
+    if (token.isEmpty) {
+      throw ExceptionWithMessage(
+        '智云课堂 CAS 回调未下发 token',
+        details: body.length > 300 ? body.substring(0, 300) : body,
+      );
+    }
+    return _ClassroomSession(httpClient: httpClient, token: token);
+  }
+
+  /// 读取 CAS 200 响应体摘要（登录页 / 未授权 service 一眼可辨）。
+  static Future<String> responseSummaryOf(HttpClientResponse response) async {
+    final body = await response.transform(utf8.decoder).join();
+    final flat = body.replaceAll('\n', ' ');
+    return flat.length > 200 ? flat.substring(0, 200) : flat;
   }
 
   static String _normalize(String input) =>
