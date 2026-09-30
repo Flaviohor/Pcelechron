@@ -175,18 +175,30 @@ var
 begin
   Result := False;
   TempFile := ExpandConstant('{temp}\pcelechron_proclist.txt');
+  // 不用管道/_findstr，逐个镜像名过滤重定向，避免 cmd 引号解析的变数。
   Exec(ExpandConstant('{sys}\cmd.exe'),
-    '/C tasklist /NH /FO CSV | findstr /I "celechron" > "' + TempFile + '"',
+    '/C tasklist /FI "IMAGENAME eq ' + AppImageName + '" /NH > "' + TempFile + '"',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   if LoadStringFromFile(TempFile, ListContent) then
   begin
-    if Pos(UpperCase('celechron'), UpperCase(ListContent)) > 0 then
+    if Pos(UpperCase(AppImageName), UpperCase(ListContent)) > 0 then
       Result := True;
-    DeleteFile(TempFile);
   end;
+  if not Result then
+  begin
+    Exec(ExpandConstant('{sys}\cmd.exe'),
+      '/C tasklist /FI "IMAGENAME eq ' + AppImageNameOld + '" /NH > "' + TempFile + '"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    if LoadStringFromFile(TempFile, ListContent) then
+    begin
+      if Pos(UpperCase(AppImageNameOld), UpperCase(ListContent)) > 0 then
+        Result := True;
+    end;
+  end;
+  DeleteFile(TempFile);
 end;
 
-function StopAppIfNeeded(const ForUninstall: Boolean): Boolean;
+function StopAppIfNeeded(const ForUninstall: Boolean; const Silent: Boolean): Boolean;
 var
   ActionName: String;
   ResultCode: Integer;
@@ -200,12 +212,15 @@ begin
   else
     ActionName := '安装';
 
-  if MsgBox('检测到 PCelechron 正在运行（可能在系统托盘中）。' + #13#10 +
-            '继续' + ActionName + '将自动关闭它，是否继续？',
-            mbConfirmation, MB_OKCANCEL) = IDCANCEL then
+  if not Silent then
   begin
-    Result := False;
-    Exit;
+    if MsgBox('检测到 PCelechron 正在运行（可能在系统托盘中）。' + #13#10 +
+              '继续' + ActionName + '将自动关闭它，是否继续？',
+              mbConfirmation, MB_OKCANCEL) = IDCANCEL then
+    begin
+      Result := False;
+      Exit;
+    end;
   end;
 
   // 强杀是安全的：Hive 为追加写，应用启动时还会清理陈旧 .lock 文件。
@@ -224,16 +239,25 @@ begin
   end;
 end;
 
+// 向导出现之前就处理运行实例：应用 1.3.5 起默认托盘常驻，升级场景下
+// 几乎必然在运行；越早关闭，后面每一步都不会再碰到文件占用。
+function InitializeSetup(): Boolean;
+begin
+  Result := StopAppIfNeeded(False, False);
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
-  if not StopAppIfNeeded(False) then
-    Result := '安装已取消。';
+  // InitializeSetup 已处理过一次；这里是静默兜底（用户在向导期间又把
+  // 应用打开的情况）。强杀后仍在运行则中止并提示。
+  if not StopAppIfNeeded(False, True) then
+    Result := '无法关闭正在运行的 PCelechron，请手动退出后重新运行安装器。';
 end;
 
 function InitializeUninstall(): Boolean;
 begin
-  Result := StopAppIfNeeded(True);
+  Result := StopAppIfNeeded(True, False);
 end;
 
 procedure InitializeWizard();
