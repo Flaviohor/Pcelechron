@@ -3,51 +3,51 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:celechron/http/zjuServices/exceptions.dart';
-import 'package:celechron/services/diagnostic_log_service.dart';
-import 'package:celechron/http/zjuServices/zjuam.dart';
 import 'package:celechron/http/zjuServices/response_utils.dart';
+import 'package:celechron/http/zjuServices/zjuam.dart';
+import 'package:celechron/services/diagnostic_log_service.dart';
 
-/// 智云课堂（classroom.zju.edu.cn）客户端：SSO 登录 + 课程搜索。
+/// 智云课堂（classroom.zju.edu.cn）客户端：CAS 换 token + 「我的课程」匹配。
 ///
-/// ## 登录链路（经两个独立开源实现交叉验证）
+/// ## 登录链路（智云课堂开发经验总结，已在鸿蒙端验证）
 ///
-/// 1. 持有统一认证的 iPlanetDirectoryPro cookie（复用 ZjuAm.getSsoCookie）；
-/// 2. 从 `tgmedia.cmc.zju.edu.cn` 的 SSO 入口出发，手工跟随最多 24 跳重定向
-///    （Location / Refresh 头、HTML meta refresh / JS location），逐跳收 cookie；
-/// 3. 结束后从 classroom.zju.edu.cn 域的 `_token` cookie 里提取 Bearer token
-///    （可能被百分号编码，也可能包在 PHP 序列化串里，两种都要处理）；
-/// 4. `userapi/v1/infosimple` 校验登录并拿账号。
+/// 1. 统一认证拿到 `iPlanetDirectoryPro`（复用 ZjuAm.getSsoCookie）；
+/// 2. 携带它请求
+///    `https://zjuam.zju.edu.cn/cas/login?service=<智云回调>`，
+///    service 指向智云自己的回调 `https://classroom.zju.edu.cn/api/v1/cas/login`；
+/// 3. CAS 校验通过后 302 到回调地址（带 `ticket=ST-xxx`），访问回调，
+///    响应 JSON 的 `data.token` 就是后续所有 API 用的 JWT Bearer。
 ///
-/// 参考：zzw4257/celechron-tauri `classroom.rs`、PeiPei233/zju-learning-assistant
-/// `zju_assist.rs`、上游 issue #144。
+/// 注意：不要走 tgmedia 的 PHP SSO 链——实测会中转到通行证(zuinfo)页面
+/// 卡死，且智云有官方 CAS 回调，service 票据直换 token 更短更稳。
+/// Token 失效（401）时清除会话重登一次再重放请求。
 ///
-/// ## 课程匹配：从「我的课程」入手
+/// ## 课程匹配：从「我的课程」入手 + 核心课名分层匹配
 ///
-/// `courseapi/v2/course-live/get-my-course-month?month=YYYY-MM`（Bearer）
-/// 返回当月本人账号的全部课节：`list[]` 为天对象数组，每项的 `course[]`
-/// 是课节对象（`id` 课程号 / `sub_id` 课节号 / `title` 课程名 / `sub_title`
-/// 节次名 / `realname` 教师，均为字符串）。取上月、本月、下月三次，
-/// 覆盖学期边界；天按升序排列，迭代序最后一节即最近一节。
+/// 数据源 `courseapi/v2/course-live/get-my-course-month?month=YYYY-MM`
+/// （Bearer），取上月/本月/下月覆盖学期边界。**智云后端是 PHP**：关联数组
+/// 序列化后 `list`/`course` 可能是 JSON Object（Map）而非 Array（List），
+/// 解析必须两种形态都兼容（空列表时又可能是 `[]`）。
 ///
-/// 之所以不用搜索接口 `pptnote/v1/searchlist`：它返回的是全站可搜课程而
-/// 非本人课程，搜得到不等于你的账号里有这门课的回放，实测导致「明明有课
-/// 却识别成没课」。账号里确实存在的课节才是有无直播/回放的依据。
+/// 课程名匹配按经验文档的分层梯队：全等 → 核心课名（剥离「网络/线上/
+/// 双语/MOOC」等修饰符与班级号）相等 → 核心课名去符号后子串包含（长度
+/// ≥3）→ 教师辅助判定（多教师拆分后任一命中加分）。
 ///
 /// ## 直达链接（用户实测确认的格式）
 ///
 /// `https://classroom.zju.edu.cn/livingroom?course_id=<id>&sub_id=<sub_id>&tenant_code=112`
-/// 该页同时支持直播与回放；对整门课取最近一节（迭代序最后一条）。早先
-/// 猜测的 `#/course/<id>` 路由是错的（只会落到官网首页）。
+/// 该页同时支持直播与回放；对整门课取迭代序最后一节（最近一节）。
 class ClassroomService {
   ClassroomService._();
 
-  static const _ssoEntryUrl =
-      'https://tgmedia.cmc.zju.edu.cn/index.php?r=auth/login&auType=cmc'
-      '&tenant_code=112&forward=https%3A%2F%2Fclassroom.zju.edu.cn%2F';
-  static const _maxRedirectHops = 24;
   static const _userAgent =
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+  static const _casLoginUrl = 'https://zjuam.zju.edu.cn/cas/login';
+  static const _classroomCasCallback =
+      'https://classroom.zju.edu.cn/api/v1/cas/login';
+  static const _myCourseMonthUrl =
+      'https://classroom.zju.edu.cn/courseapi/v2/course-live/get-my-course-month';
 
   static _ClassroomSession? _session;
   static final Map<String, ClassroomMatch?> _matchCache = {};
@@ -102,41 +102,55 @@ class ClassroomService {
       await Future<void>.delayed(const Duration(seconds: 2));
       session = await _ensureSession(username: username, password: password);
     }
-    final lessons = await _fetchMyLessons(session);
 
-    // 归一化后挑选最匹配的课程：名字互含 + 教师命中加分。
+    var lessons = await _fetchMyLessons(session);
+    if (lessons == null) {
+      // 401：token 失效，重登一次再试（经验文档「Token 失效自动刷新」）。
+      _session = null;
+      session = await _ensureSession(username: username, password: password);
+      lessons = await _fetchMyLessons(session) ?? const <ClassroomLesson>[];
+    }
+
+    // 匹配按经验文档的分层梯队执行，取最高梯队的全部课节。
     final target = _normalize(courseName);
-    final teacherKey = _normalize(teacher ?? '');
+    final targetCore = extractCoreCourseName(courseName);
+    final teacherSet = _teachersOf(teacher);
     final subIds = <int>{};
     int? latestCourseId;
     int? latestSubId;
     String bestTitle = '';
     String bestRealname = '';
-    var bestScore = 0;
+    var bestTier = 0;
 
     for (final lesson in lessons) {
-      final title = _normalize(lesson.title);
-      if (title.isEmpty) continue;
-      var score = 0;
-      if (title == target) {
-        score = 3;
-      } else if (title.contains(target) || target.contains(title)) {
-        score = title.length >= 4 || target.length >= 4 ? 2 : 0;
+      final remote = _normalize(lesson.title);
+      final remoteCore = extractCoreCourseName(lesson.title);
+      if (remote.isEmpty) continue;
+
+      var tier = 0;
+      if (remote == target) {
+        tier = 4; // 全等
+      } else if (targetCore.isNotEmpty && remoteCore == targetCore) {
+        tier = 3; // 核心课名相等
+      } else if (targetCore.length >= 3 &&
+          (remoteCore.contains(targetCore) ||
+              targetCore.contains(remoteCore))) {
+        tier = 2; // 核心课名子串包含
       }
-      if (score <= 0) continue;
-      if (teacherKey.isNotEmpty) {
+      if (tier <= 0) continue;
+
+      if (teacherSet.isNotEmpty) {
         final lecturer = _normalize(lesson.realname);
         if (lecturer.isNotEmpty &&
-            (lecturer.contains(teacherKey) || teacherKey.contains(lecturer))) {
-          score += 1;
-        } else if (bestScore > 0) {
-          // 教师写法不一致时降权而非淘汰，让同教师的课程优先。
-          score -= 1;
+            teacherSet
+                .any((t) => lecturer.contains(t) || t.contains(lecturer))) {
+          tier += 1; // 教师辅助加分（多教师拆分后任一命中即可）
         }
       }
-      if (score >= bestScore) {
-        if (score > bestScore) {
-          bestScore = score;
+
+      if (tier >= bestTier) {
+        if (tier > bestTier) {
+          bestTier = tier;
           subIds.clear();
         }
         bestTitle = lesson.title;
@@ -152,7 +166,7 @@ class ClassroomService {
       operation: 'match',
       message: subIds.isEmpty
           ? '我的课程共 ${lessons.length} 节，无「$courseName」的匹配'
-          : '我的课程共 ${lessons.length} 节，「$courseName」命中 '
+          : '我的课程共 ${lessons.length} 节，「$courseName」按梯队 $bestTier 命中 '
               '${subIds.length} 节（course_id=$latestCourseId）',
     );
     if (latestCourseId == null || latestSubId == null || subIds.isEmpty) {
@@ -173,7 +187,9 @@ class ClassroomService {
   }
 
   /// 拉取上月/本月/下月的「我的课程」课节，按 subId 去重。
-  static Future<List<ClassroomLesson>> _fetchMyLessons(
+  ///
+  /// token 失效（401）返回 null，由调用方重登后重试。
+  static Future<List<ClassroomLesson>?> _fetchMyLessons(
       _ClassroomSession session) async {
     final now = DateTime.now();
     final months = <String>{
@@ -184,8 +200,7 @@ class ClassroomService {
     final lessons = <ClassroomLesson>[];
     final seenSubIds = <int>{};
     for (final month in months) {
-      final uri = Uri.parse(
-              'https://classroom.zju.edu.cn/courseapi/v2/course-live/get-my-course-month')
+      final uri = Uri.parse(_myCourseMonthUrl)
           .replace(queryParameters: {'month': month});
       final request = await session.httpClient.openUrl('GET', uri);
       request.headers.set('User-Agent', _userAgent);
@@ -194,13 +209,18 @@ class ClassroomService {
             const Duration(seconds: 8),
             onTimeout: () => throw requestTimeout(),
           );
+      if (response.statusCode == HttpStatus.unauthorized) {
+        await response.drain<void>();
+        return null; // token 失效
+      }
       final body = await response.transform(utf8.decoder).join();
       final payload = decodeJsonMap(body, context: '智云课堂我的课程');
-      final days = asDynamicList(payload['list']) ?? const [];
-      for (final rawDay in days) {
+
+      // PHP 后端：list 可能是 Array，也可能（历史数据/空表）是 Object。
+      for (final rawDay in _iterableOf(payload['list'])) {
         final day = asStringMap(rawDay);
         if (day == null) continue;
-        for (final rawLesson in asDynamicList(day['course']) ?? const []) {
+        for (final rawLesson in _iterableOf(day['course'])) {
           final lesson = asStringMap(rawLesson);
           if (lesson == null) continue;
           final courseId = _asId(lesson['id']);
@@ -222,162 +242,87 @@ class ClassroomService {
     return lessons;
   }
 
+  /// PHP 关联数组兼容：List 直接用，Map 取 values（见类文档「课程匹配」）。
+  static Iterable<Object?> _iterableOf(Object? raw) {
+    if (raw is List) return raw;
+    if (raw is Map) return raw.values;
+    return const [];
+  }
+
   static String _monthKey(DateTime date) =>
       '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}';
 
-  // ===== 登录 =====
+  // ===== 登录：CAS service 票据直换智云 token =====
 
   static Future<_ClassroomSession> _login(Cookie? iPlanetCookie) async {
     if (iPlanetCookie == null) {
       throw ExceptionWithMessage('统一认证未登录，无法访问智云课堂');
     }
-    final jar = _CookieJar();
-    // iPlanet 不仅要给 zjuam：SSO 链会经过通行证(zuinfo.zju.edu.cn)等
-    // 浙大系主机，统一挂到父域 zju.edu.cn 让全链都能带上凭据。
-    jar.set('zju.edu.cn', iPlanetCookie.name, iPlanetCookie.value);
-
     final httpClient = HttpClient()..autoUncompress = true;
-    var currentUrl = Uri.parse(_ssoEntryUrl);
-    var reachedClassroom = false;
-    var lastBody = '';
-
     try {
-      for (var hop = 0; hop < _maxRedirectHops; hop++) {
-        final request = await httpClient.openUrl('GET', currentUrl).timeout(
+      final service = Uri.encodeComponent(_classroomCasCallback);
+      final casUri = Uri.parse('$_casLoginUrl?service=$service');
+      final casRequest = await httpClient.openUrl('GET', casUri).timeout(
             const Duration(seconds: 8),
-            onTimeout: () => throw requestTimeout());
-        request.followRedirects = false;
+            onTimeout: () => throw requestTimeout(),
+          );
+      casRequest.followRedirects = false;
+      casRequest.headers.set('User-Agent', _userAgent);
+      casRequest.cookies.add(Cookie(iPlanetCookie.name, iPlanetCookie.value));
+      final casResponse = await casRequest.close().timeout(
+            const Duration(seconds: 8),
+            onTimeout: () => throw requestTimeout(),
+          );
+      await casResponse.drain<void>();
+
+      final location = casResponse.headers.value(HttpHeaders.locationHeader);
+      if (casResponse.statusCode != HttpStatus.movedTemporarily ||
+          location == null ||
+          !location.contains('ticket=')) {
+        // iPlanet 失效时 CAS 返回登录页（200）而非 302 带票跳转。
+        throw ExceptionWithMessage(
+          '统一认证会话无效，未能取得智云课堂票据',
+          details: 'CAS 状态 ${casResponse.statusCode}，'
+              'Location=${location ?? '<无>'}',
+        );
+      }
+
+      // 跟随回调（可能再有一跳），最终应返回含 token 的 JSON。
+      var callbackUrl = Uri.parse(location);
+      String body = '';
+      for (var hop = 0; hop < 5; hop++) {
+        final request = await httpClient.openUrl('GET', callbackUrl).timeout(
+              const Duration(seconds: 8),
+              onTimeout: () => throw requestTimeout(),
+            );
+        request.followRedirects = hop < 4;
         request.headers.set('User-Agent', _userAgent);
-        for (final cookie in jar.cookiesFor(currentUrl)) {
-          request.cookies.add(cookie);
-        }
         final response = await request.close().timeout(
               const Duration(seconds: 8),
               onTimeout: () => throw requestTimeout(),
             );
-
-        // 逐条收下 Set-Cookie；带 Domain 属性的按父域归档。
-        for (final raw in response.headers[HttpHeaders.setCookieHeader] ?? []) {
-          jar.store(currentUrl, raw);
-        }
-        final body = await response.transform(utf8.decoder).join();
-
-        final target = _nextTarget(currentUrl, response, body);
-        if (target != null) {
-          currentUrl = target;
+        body = await response.transform(utf8.decoder).join();
+        final next = response.headers.value(HttpHeaders.locationHeader);
+        if (next != null && next.isNotEmpty) {
+          callbackUrl = callbackUrl.resolve(next);
           continue;
         }
-        reachedClassroom = currentUrl.host == 'classroom.zju.edu.cn' ||
-            (currentUrl.host.endsWith('.cmc.zju.edu.cn') &&
-                body.contains('classroom.zju.edu.cn'));
-        lastBody = body;
         break;
       }
+
+      final payload = decodeJsonMap(body, context: '智云课堂 CAS 回调');
+      final data = asStringMap(payload['data']);
+      final token = (asString(data?['token']) ?? '').trim();
+      if (token.isEmpty) {
+        throw ExceptionWithMessage(
+          '智云课堂 CAS 回调未下发 token',
+          details: body.length > 300 ? body.substring(0, 300) : body,
+        );
+      }
+      return _ClassroomSession(httpClient: httpClient, token: token);
     } on Object {
       httpClient.close();
       rethrow;
-    }
-
-    if (!reachedClassroom) {
-      final snippet = lastBody.length > 160
-          ? lastBody.substring(0, 160).replaceAll('\n', ' ')
-          : lastBody;
-      throw ExceptionWithMessage(
-          '智云课堂 SSO 未完成（停留在 ${currentUrl.host}）；校园网不可达或登录态失效',
-          details: snippet);
-    }
-
-    // 首页预热：确保 classroom 域的会话 cookie 齐全。
-    final warmUp = await httpClient.openUrl(
-        'GET', Uri.parse('https://classroom.zju.edu.cn/'));
-    warmUp.followRedirects = true;
-    warmUp.headers.set('User-Agent', _userAgent);
-    for (final cookie
-        in jar.cookiesFor(Uri.parse('https://classroom.zju.edu.cn/'))) {
-      warmUp.cookies.add(cookie);
-    }
-    final warmUpResponse = await warmUp.close().timeout(
-          const Duration(seconds: 8),
-          onTimeout: () => throw requestTimeout(),
-        );
-    await warmUpResponse.drain<void>();
-
-    final token = jar.tokenFor('classroom.zju.edu.cn');
-    if (token == null || token.isEmpty) {
-      throw ExceptionWithMessage('智云课堂登录态缺失（_token cookie 未下发）');
-    }
-
-    final infoUri =
-        Uri.parse('https://classroom.zju.edu.cn/userapi/v1/infosimple');
-    final infoRequest = await httpClient.openUrl('GET', infoUri);
-    infoRequest.headers.set('User-Agent', _userAgent);
-    infoRequest.headers.set('Authorization', 'Bearer $token');
-    final infoResponse = await infoRequest.close().timeout(
-          const Duration(seconds: 8),
-          onTimeout: () => throw requestTimeout(),
-        );
-    final infoBody = await infoResponse.transform(utf8.decoder).join();
-    final info = decodeJsonMap(infoBody, context: '智云课堂用户信息');
-    final params = asStringMap(info['params']) ?? {};
-    final account = (asString(params['account']) ?? '').trim();
-    final userId = (params['id']?.toString() ?? '').trim();
-    if (account.isEmpty) {
-      throw ExceptionWithMessage('智云课堂登录校验失败（用户信息为空）');
-    }
-    return _ClassroomSession(
-      httpClient: httpClient,
-      token: token,
-      account: account,
-      userId: userId,
-    );
-  }
-
-  /// 从重定向响应里解析下一跳地址：Location 头 → Refresh 头 → HTML/JS 内联。
-  static Uri? _nextTarget(
-      Uri current, HttpClientResponse response, String body) {
-    final location = response.headers.value(HttpHeaders.locationHeader);
-    final resolved = _resolveUrl(current, location);
-    if (resolved != null) return resolved;
-
-    final refresh = response.headers.value('refresh');
-    if (refresh != null) {
-      final parts = refresh.split(';');
-      for (final part in parts) {
-        final t = part.trim();
-        if (t.toLowerCase().startsWith('url=')) {
-          final resolvedRefresh = _resolveUrl(current, t.substring(4));
-          if (resolvedRefresh != null) return resolvedRefresh;
-        }
-      }
-    }
-
-    final patterns = [
-      RegExp(r'''url=([^"'\s>]+)''', caseSensitive: false),
-      RegExp(r'''location\.href\s*=\s*["']([^"']+)["']'''),
-      RegExp(r'''window\.location\s*=\s*["']([^"']+)["']'''),
-      RegExp(r'''window\.location\.replace\(["']([^"']+)["']\)'''),
-      RegExp(r'''location\.replace\(["']([^"']+)["']\)'''),
-      RegExp(
-          r'''(?:top|self|parent)\.location(?:\.href)?\s*=\s*["']([^"']+)["']'''),
-    ];
-    for (final pattern in patterns) {
-      final match = pattern.firstMatch(body);
-      if (match != null) {
-        final resolvedHtml = _resolveUrl(current, match.group(1));
-        if (resolvedHtml != null) return resolvedHtml;
-      }
-    }
-    return null;
-  }
-
-  static Uri? _resolveUrl(Uri current, String? target) {
-    if (target == null) return null;
-    final trimmed = target.trim().trimMatches('"\'');
-    if (trimmed.isEmpty) return null;
-    try {
-      return current.resolve(trimmed);
-    } on FormatException {
-      return Uri.tryParse(trimmed);
     }
   }
 
@@ -389,6 +334,31 @@ class ClassroomService {
     if (value is num) return value.toInt();
     return int.tryParse(value?.toString().trim() ?? '');
   }
+
+  /// 教务教师字段拆分：`张三,李四` / `张三/李四` / `张三、李四` 均可。
+  static Set<String> _teachersOf(String? teacher) {
+    if (teacher == null || teacher.trim().isEmpty) return const {};
+    return teacher
+        .split(RegExp(r'[,，/、;；]'))
+        .map(_normalize)
+        .where((t) => t.isNotEmpty)
+        .toSet();
+  }
+}
+
+/// 提取核心课名（经验文档「课程匹配核心算法」）：
+/// 统一全角括号为半角 → 剥离教学方式修饰符（网络/线上/双语/MOOC 等）与
+/// 班级号（01班/[01]/【02】）→ 去空白。保留等级与罗马数字（如 微积分（甲）I）。
+String extractCoreCourseName(String name) {
+  var result = name.replaceAll('（', '(').replaceAll('）', ')');
+  result = result.replaceAll(
+      RegExp(r'[((](?:网络|线上|线下|双语|全英文|英文|MOOC|慕课|网课)[))]',
+          caseSensitive: false),
+      '');
+  result = result.replaceAll(RegExp(r'[([](?:\d{1,2})班[)\]]'), '');
+  result = result.replaceAll(RegExp(r'[[【]\d{1,3}[】\]]'), '');
+  result = result.replaceAll(RegExp(r'\s+'), '');
+  return result.trim();
 }
 
 /// 一次成功解析的智云课堂课程：匹配条目 + 课节数 + 最近一节。
@@ -436,116 +406,6 @@ class ClassroomCourse {
 class _ClassroomSession {
   final HttpClient httpClient;
   final String token;
-  final String account;
-  final String userId;
 
-  const _ClassroomSession({
-    required this.httpClient,
-    required this.token,
-    required this.account,
-    required this.userId,
-  });
-}
-
-/// 极简 cookie 罐：按域名归档，请求时带上域名后缀匹配的所有 cookie。
-class _CookieJar {
-  final Map<String, Map<String, String>> _store = {};
-
-  void set(String host, String name, String value) {
-    _store.putIfAbsent(host, () => {})[name] = value;
-  }
-
-  /// 解析并归档一条 Set-Cookie；Domain 属性决定归档域（点前缀剥掉）。
-  void store(Uri requestUri, String raw) {
-    final segments = raw.split(';');
-    if (segments.isEmpty) return;
-    final pair = segments.first;
-    final eq = pair.indexOf('=');
-    if (eq <= 0) return;
-    var name = pair.substring(0, eq).trim();
-    var value = pair.substring(eq + 1).trim();
-    var host = requestUri.host;
-    for (final attr in segments.skip(1)) {
-      final attrPair = attr.trim();
-      if (attrPair.toLowerCase().startsWith('domain=')) {
-        var domain = attrPair.substring(7).trim();
-        if (domain.startsWith('.')) domain = domain.substring(1);
-        if (domain.isNotEmpty) host = domain;
-      }
-      if (attrPair.toLowerCase().startsWith('expires=') ||
-          attrPair.toLowerCase().startsWith('max-age=')) {
-        // 过期语义从简：会话级缓存不持久化，忽略过期属性。
-        continue;
-      }
-      if (name.isEmpty) name = '';
-    }
-    if (name.isEmpty) return;
-    if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
-      value = value.substring(1, value.length - 1);
-    }
-    set(host, name, value);
-  }
-
-  List<Cookie> cookiesFor(Uri requestUri) {
-    final host = requestUri.host;
-    final result = <Cookie>[];
-    _store.forEach((domain, cookies) {
-      final matches = host == domain || host.endsWith('.$domain');
-      if (matches) {
-        cookies.forEach((name, value) {
-          result.add(Cookie(name, value));
-        });
-      }
-    });
-    return result;
-  }
-
-  /// 取某域下的 `_token` cookie：先原样、再百分号解码、再 PHP 序列化兜底。
-  String? tokenFor(String host) {
-    // cookie 可能带 Domain=.zju.edu.cn / .cmc.zju.edu.cn 属性，归档键
-    // 不一定是 host 本身：host 及其父域都找一遍。
-    String? raw;
-    for (final entry in _store.entries) {
-      if (raw != null) break;
-      final domain = entry.key;
-      if (host == domain || host.endsWith('.$domain')) {
-        final value = entry.value['_token'];
-        if (value != null && value.isNotEmpty) raw = value;
-      }
-    }
-    if (raw == null) return null;
-    final candidates = <String>[raw];
-    try {
-      candidates.add(Uri.decodeComponent(raw));
-    } on ArgumentError {
-      // 非法百分号编码就跳过解码分支。
-    }
-    final serialized = RegExp(r'\{i:\d+;s:\d+:"_token";i:\d+;s:\d+:"(.+?)";\}');
-    for (final candidate in candidates) {
-      final direct = candidate.trim().trimMatches('"');
-      if (direct.isNotEmpty && !direct.contains(';s:')) return direct;
-      final match = serialized.firstMatch(candidate);
-      if (match != null) {
-        final inner = match.group(1);
-        if (inner != null && inner.trim().isNotEmpty) return inner.trim();
-      }
-    }
-    return null;
-  }
-}
-
-extension on String {
-  String trimMatches(String chars) {
-    var result = this;
-    for (final c in chars.split('')) {
-      result = result.trim();
-      while (result.startsWith(c)) {
-        result = result.substring(1);
-      }
-      while (result.endsWith(c)) {
-        result = result.substring(0, result.length - 1);
-      }
-    }
-    return result;
-  }
+  const _ClassroomSession({required this.httpClient, required this.token});
 }
