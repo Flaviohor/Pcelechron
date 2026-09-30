@@ -175,7 +175,9 @@ var
   ListText: String;
 begin
   Result := False;
-  TempFile := ExpandConstant('{temp}\pcelechron_proclist.txt');
+  // Inno 没有 {temp} 常量（只有 {tmp}，且 InitializeSetup 阶段不可用），
+  // 用环境变量 TEMP 取用户临时目录。
+  TempFile := RemoveBackslashUnlessRoot(GetEnv('TEMP')) + '\pcelechron_proclist.txt';
   // 不用管道/_findstr，逐个镜像名过滤重定向，避免 cmd 引号解析的变数。
   Exec(ExpandConstant('{sys}\cmd.exe'),
     '/C tasklist /FI "IMAGENAME eq ' + AppImageName + '" /NH > "' + TempFile + '"',
