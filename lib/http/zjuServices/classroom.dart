@@ -94,8 +94,14 @@ class ClassroomService {
     final cacheKey = '$courseName|$teacher';
     if (_matchCache.containsKey(cacheKey)) return _matchCache[cacheKey];
 
-    final session =
-        await _ensureSession(username: username, password: password);
+    // zjuam CAS 登录偶发 8s 超时（诊断日志实测），失败后等 2 秒重试一次。
+    _ClassroomSession session;
+    try {
+      session = await _ensureSession(username: username, password: password);
+    } on Object {
+      await Future<void>.delayed(const Duration(seconds: 2));
+      session = await _ensureSession(username: username, password: password);
+    }
     final lessons = await _fetchMyLessons(session);
 
     // 归一化后挑选最匹配的课程：名字互含 + 教师命中加分。
@@ -226,7 +232,9 @@ class ClassroomService {
       throw ExceptionWithMessage('统一认证未登录，无法访问智云课堂');
     }
     final jar = _CookieJar();
-    jar.set('zjuam.zju.edu.cn', iPlanetCookie.name, iPlanetCookie.value);
+    // iPlanet 不仅要给 zjuam：SSO 链会经过通行证(zuinfo.zju.edu.cn)等
+    // 浙大系主机，统一挂到父域 zju.edu.cn 让全链都能带上凭据。
+    jar.set('zju.edu.cn', iPlanetCookie.name, iPlanetCookie.value);
 
     final httpClient = HttpClient()..autoUncompress = true;
     var currentUrl = Uri.parse(_ssoEntryUrl);
@@ -348,6 +356,9 @@ class ClassroomService {
       RegExp(r'''location\.href\s*=\s*["']([^"']+)["']'''),
       RegExp(r'''window\.location\s*=\s*["']([^"']+)["']'''),
       RegExp(r'''window\.location\.replace\(["']([^"']+)["']\)'''),
+      RegExp(r'''location\.replace\(["']([^"']+)["']\)'''),
+      RegExp(
+          r'''(?:top|self|parent)\.location(?:\.href)?\s*=\s*["']([^"']+)["']'''),
     ];
     for (final pattern in patterns) {
       final match = pattern.firstMatch(body);
