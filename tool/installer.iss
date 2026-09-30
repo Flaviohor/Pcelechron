@@ -171,7 +171,8 @@ function IsAppRunning(): Boolean;
 var
   ResultCode: Integer;
   TempFile: String;
-  ListContent: String;
+  ListContent: AnsiString;
+  ListText: String;
 begin
   Result := False;
   TempFile := ExpandConstant('{temp}\pcelechron_proclist.txt');
@@ -181,7 +182,8 @@ begin
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   if LoadStringFromFile(TempFile, ListContent) then
   begin
-    if Pos(UpperCase(AppImageName), UpperCase(ListContent)) > 0 then
+    ListText := ListContent;
+    if Pos(UpperCase(AppImageName), UpperCase(ListText)) > 0 then
       Result := True;
   end;
   if not Result then
@@ -191,7 +193,8 @@ begin
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     if LoadStringFromFile(TempFile, ListContent) then
     begin
-      if Pos(UpperCase(AppImageNameOld), UpperCase(ListContent)) > 0 then
+      ListText := ListContent;
+      if Pos(UpperCase(AppImageNameOld), UpperCase(ListText)) > 0 then
         Result := True;
     end;
   end;
