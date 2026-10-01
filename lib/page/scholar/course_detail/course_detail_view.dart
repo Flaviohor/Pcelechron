@@ -12,7 +12,7 @@ import 'package:celechron/model/exam.dart';
 import 'package:celechron/model/session.dart';
 import 'package:celechron/model/scholar.dart';
 import 'package:celechron/services/diagnostic_log_service.dart';
-import 'package:celechron/http/zjuServices/classroom.dart';
+import 'package:celechron/services/zhiyun_service.dart';
 import 'package:celechron/model/task.dart';
 import 'package:celechron/utils/utils.dart';
 import 'package:flutter/services.dart' show Clipboard, ClipboardData;
@@ -560,12 +560,12 @@ class CourseDetailPage extends StatelessWidget {
     return a.contains(b) || b.contains(a);
   }
 
-  /// 智云课堂入口卡片（直连版）。
+  /// 智云课堂回放卡片（ZhiyunService 驱动）。
   ///
-  /// 登录链路与搜索接口经 celechron-tauri / zju-learning-assistant 两个开源
-  /// 实现交叉验证；SPA 课程页路由无公开先例，采用 `#/course/<id>` 直达——
-  /// hash 路由拼错只会落到官网默认页，且课程名始终先写入剪贴板兜底。
-  /// 课程没有回放（尚未上课 / 回放未生成）或查找失败时不展示本卡片。
+  /// 状态完全由 [ZhiyunService.resolveCourse] 决定：ready 显示直达卡片；
+  /// notMatched（我的课程与搜索都找不到 / 无回放小节）整段隐藏；
+  /// error（登录失败、网络不可达等）保留卡片并显示原因，点击回退到
+  /// 智云官网首页——失败可见，不静默消失。
   Widget _buildClassroomSection(BuildContext context) {
     return _ClassroomSection(course: course);
   }
@@ -581,9 +581,10 @@ class _ClassroomSection extends StatefulWidget {
 }
 
 class _ClassroomSectionState extends State<_ClassroomSection> {
-  _ClassroomPhase _phase = _ClassroomPhase.checking;
-  ClassroomMatch? _match;
+  _ZhiyunPhase _phase = _ZhiyunPhase.checking;
+  ZhiyunResolve? _result;
   bool _opening = false;
+  String _detail = '';
 
   @override
   void initState() {
@@ -592,60 +593,70 @@ class _ClassroomSectionState extends State<_ClassroomSection> {
   }
 
   Future<void> _resolve() async {
+    if (!mounted) return;
+    setState(() {
+      _phase = _ZhiyunPhase.checking;
+      _detail = '';
+    });
     final scholar = Get.find<Rx<Scholar>>(tag: 'scholar').value;
     if (!scholar.isLogan) {
-      if (!mounted) return;
-      setState(() => _phase = _ClassroomPhase.hidden);
+      _finish(_ZhiyunPhase.error, '未登录，登录后即可关联智云课堂回放');
       return;
     }
-    try {
-      final match = await ClassroomService.resolveCourse(
-        courseName: widget.course.name,
-        teacher: widget.course.teacher,
-        username: scholar.username,
-        password: scholar.password,
-      );
-      if (!mounted) return;
-      setState(() {
-        _match = match;
-        _phase = match == null || match.subCount == 0
-            ? _ClassroomPhase.hidden
-            : _ClassroomPhase.ready;
-      });
-    } on Object catch (error, stackTrace) {
-      // 查不出来（不在校园网/登录失效等）一律不展示，避免给用户一个死卡片。
+    final result = await ZhiyunService.resolveCourse(
+      courseName: widget.course.name,
+      teacher: widget.course.teacher,
+      username: scholar.username,
+      password: scholar.password,
+    );
+    if (!mounted) return;
+    switch (result.kind) {
+      case ZhiyunResolveKind.ready:
+        setState(() {
+          _phase = _ZhiyunPhase.ready;
+          _result = result;
+        });
+      case ZhiyunResolveKind.notMatched:
+        setState(() {
+          _phase = _ZhiyunPhase.hidden;
+        });
+      case ZhiyunResolveKind.error:
+        _finish(_ZhiyunPhase.error, result.errorMessage);
+    }
+  }
+
+  void _finish(_ZhiyunPhase phase, String detail) {
+    if (!mounted) return;
+    setState(() {
+      _phase = phase;
+      _detail = detail;
+    });
+    if (phase == _ZhiyunPhase.error) {
       DiagnosticLogService.instance.record(
-        level: CelechronLogLevel.info,
-        module: 'classroom',
+        module: 'zhiyun',
         operation: 'resolve',
-        message: '智云课堂回放检查未通过，隐藏入口卡片',
-        error: error,
-        stackTrace: stackTrace,
+        message: '智云课堂卡片进入失败态：$detail',
       );
-      if (!mounted) return;
-      setState(() => _phase = _ClassroomPhase.hidden);
     }
   }
 
   Future<void> _open() async {
-    if (_opening || _match == null) return;
-    setState(() {
-      _opening = true;
-    });
-
-    // 课程名始终先进剪贴板：即使直达路由未命中，官网搜索一贴即中。
+    if (_opening) return;
+    setState(() => _opening = true);
+    final result = _result;
+    // 课程名始终先入剪贴板：即便直达路由有出入，官网搜索一贴即中。
     await Clipboard.setData(ClipboardData(text: widget.course.name));
-    // 直达最近一节课的直播/回放页（用户实测确认的 URL 格式）。
-    await launchUrlString(
-        'https://classroom.zju.edu.cn/livingroom?course_id='
-        '${_match!.course.courseId}'
-        '&sub_id=${_match!.latestSubId}&tenant_code=112',
-        mode: LaunchMode.externalApplication);
-    if (mounted) {
-      setState(() {
-        _opening = false;
-      });
+    var target = 'https://classroom.zju.edu.cn/';
+    if (result != null &&
+        result.kind == ZhiyunResolveKind.ready &&
+        result.courseId != null &&
+        result.latestSubId != null) {
+      target =
+          ZhiyunService.livingroomUrl(result.courseId!, result.latestSubId!);
     }
+    await launchUrlString(target, mode: LaunchMode.externalApplication);
+    if (!mounted) return;
+    setState(() => _opening = false);
   }
 
   @override
@@ -655,91 +666,157 @@ class _ClassroomSectionState extends State<_ClassroomSection> {
       curve: Curves.easeOutCubic,
       alignment: Alignment.topCenter,
       child: switch (_phase) {
-        _ClassroomPhase.hidden => const SizedBox(
-            width: double.infinity,
+        _ZhiyunPhase.hidden => const SizedBox(width: double.infinity),
+        _ZhiyunPhase.checking => _wrapCard(
+            context,
+            title: '正在检查智云课堂的回放…',
+            detail: '登录智云课堂并匹配本课（需校园网）',
+            trailing: const CupertinoActivityIndicator(radius: 9),
           ),
-        _ClassroomPhase.checking => Column(
-            children: [
-              SubSubtitleRow(subtitle: '课堂回放'),
-              RoundRectangleCard(
-                child: Padding(
-                  padding: const EdgeInsets.only(left: 8, right: 8),
-                  child: Row(
-                    children: [
-                      const Icon(CupertinoIcons.play_circle,
-                          size: 26, color: CupertinoColors.activeBlue),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Text('正在检查智云课堂的回放…',
+        _ZhiyunPhase.ready => RoundRectangleCard(
+            onTap: _opening ? null : _open,
+            child: Padding(
+              padding: const EdgeInsets.only(left: 8, right: 8),
+              child: Row(
+                children: [
+                  const Icon(CupertinoIcons.play_circle,
+                      size: 26, color: CupertinoColors.activeBlue),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('智云课堂 · ${widget.course.name}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
                             style: CupertinoTheme.of(context)
                                 .textTheme
                                 .textStyle
                                 .copyWith(
                                     fontSize: 15, fontWeight: FontWeight.w600)),
-                      ),
-                      const CupertinoActivityIndicator(radius: 9),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-          ),
-        _ClassroomPhase.ready => Column(
-            children: [
-              SubSubtitleRow(subtitle: '课堂回放'),
-              RoundRectangleCard(
-                onTap: _opening ? null : _open,
-                child: Padding(
-                  padding: const EdgeInsets.only(left: 8, right: 8),
-                  child: Row(
-                    children: [
-                      const Icon(CupertinoIcons.play_circle,
-                          size: 26, color: CupertinoColors.activeBlue),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text('智云课堂 · ${widget.course.name}',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: CupertinoTheme.of(context)
-                                    .textTheme
-                                    .textStyle
-                                    .copyWith(
-                                        fontSize: 15,
-                                        fontWeight: FontWeight.w600)),
-                            Text(
-                              _match!.course.realname.isEmpty
-                                  ? '我的课程里匹配到 ${_match!.subCount} 节课，点击直达最近一节'
-                                  : '我的课程里匹配到 ${_match!.subCount} 节课 · ${_match!.course.realname}，点击直达最近一节',
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: CupertinoDynamicColor.resolve(
-                                    CupertinoColors.secondaryLabel, context),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      if (_opening)
-                        const CupertinoActivityIndicator(radius: 9)
-                      else
-                        Icon(CupertinoIcons.chevron_right,
-                            size: 14,
+                        Text(
+                          _readySubtitle,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12,
                             color: CupertinoDynamicColor.resolve(
-                                CupertinoColors.tertiaryLabel, context)),
-                    ],
+                                CupertinoColors.secondaryLabel, context),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
+                  if (_opening)
+                    const CupertinoActivityIndicator(radius: 9)
+                  else
+                    Icon(CupertinoIcons.chevron_right,
+                        size: 14,
+                        color: CupertinoDynamicColor.resolve(
+                            CupertinoColors.tertiaryLabel, context)),
+                ],
               ),
-            ],
+            ),
+          ),
+        _ZhiyunPhase.error => RoundRectangleCard(
+            onTap: () => _openOfficial(),
+            child: Padding(
+              padding: const EdgeInsets.only(left: 8, right: 8),
+              child: Row(
+                children: [
+                  Icon(CupertinoIcons.exclamationmark_circle,
+                      size: 26,
+                      color: CupertinoDynamicColor.resolve(
+                          CupertinoColors.systemOrange, context)),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('智云课堂暂不可用',
+                            style: CupertinoTheme.of(context)
+                                .textTheme
+                                .textStyle
+                                .copyWith(
+                                    fontSize: 15, fontWeight: FontWeight.w600)),
+                        Text(_detail,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: CupertinoDynamicColor.resolve(
+                                  CupertinoColors.secondaryLabel, context),
+                            )),
+                      ],
+                    ),
+                  ),
+                  CupertinoButton(
+                    padding: EdgeInsets.zero,
+                    onPressed: _resolve,
+                    child: Text('重试',
+                        style: TextStyle(
+                            fontSize: 14,
+                            color: CupertinoDynamicColor.resolve(
+                                CupertinoColors.activeBlue, context))),
+                  ),
+                ],
+              ),
+            ),
           ),
       },
     );
   }
+
+  String get _readySubtitle {
+    final result = _result;
+    if (result == null) return '';
+    final teacher = result.realname.isEmpty ? '' : ' · ${result.realname}';
+    return '已匹配到 ${result.subCount} 节回放$teacher，点击直达最近一节（需校园网）';
+  }
+
+  Widget _wrapCard(
+    BuildContext context, {
+    required String title,
+    required String detail,
+    required Widget trailing,
+  }) {
+    return RoundRectangleCard(
+      child: Padding(
+        padding: const EdgeInsets.only(left: 8, right: 8),
+        child: Row(
+          children: [
+            const Icon(CupertinoIcons.play_circle,
+                size: 26, color: CupertinoColors.activeBlue),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title,
+                      style: CupertinoTheme.of(context)
+                          .textTheme
+                          .textStyle
+                          .copyWith(fontSize: 15, fontWeight: FontWeight.w600)),
+                  Text(detail,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: CupertinoDynamicColor.resolve(
+                            CupertinoColors.secondaryLabel, context),
+                      )),
+                ],
+              ),
+            ),
+            trailing,
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openOfficial() async {
+    await launchUrlString('https://classroom.zju.edu.cn/',
+        mode: LaunchMode.externalApplication);
+  }
 }
 
-enum _ClassroomPhase { checking, hidden, ready }
+enum _ZhiyunPhase { checking, hidden, ready, error }
