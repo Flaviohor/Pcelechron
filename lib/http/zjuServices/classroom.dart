@@ -9,36 +9,34 @@ import 'package:celechron/http/zjuServices/zjuam.dart';
 import 'package:celechron/services/diagnostic_log_service.dart';
 import 'package:get/get.dart';
 
-/// 智云课堂（classroom.zju.edu.cn）客户端：CAS 换 token + 「我的课程」匹配。
+/// 智云课堂（classroom.zju.edu.cn）客户端：CAS 换 token + 回放关联匹配。
 ///
-/// ## 登录链路（智云课堂开发经验总结，已在鸿蒙端验证）
+/// ## 登录（经验报告·二：CAS SSO → 智云 Bearer Token 兑换链路）
 ///
 /// 1. 统一认证拿到 `iPlanetDirectoryPro`（复用 ZjuAm.getSsoCookie）；
-/// 2. 携带它请求
-///    `https://zjuam.zju.edu.cn/cas/login?service=<智云回调>`，
-///    service 指向智云自己的回调 `https://classroom.zju.edu.cn/api/v1/cas/login`；
-/// 3. CAS 校验通过后 302 到回调地址（带 `ticket=ST-xxx`），访问回调，
-///    响应 JSON 的 `data.token` 就是后续所有 API 用的 JWT Bearer。
+/// 2. 携带它请求 `zjuam/cas/login?service=<智云回调>`；
+/// 3. CAS 302 带票（ticket=ST-xxx）→ 访问回调
+///    `classroom.zju.edu.cn/api/v1/cas/login?ticket=...`；
+/// 4. 响应 JSON 的 `data.token` 即 JWT Bearer，持久化双缓存，
+///    401 时清缓存重登并重放请求。
 ///
-/// 注意：不要走 tgmedia 的 PHP SSO 链——实测会中转到通行证(zuinfo)页面
-/// 卡死，且智云有官方 CAS 回调，service 票据直换 token 更短更稳。
-/// Token 持久化在 dbOptions，401 时清掉重登（经验文档一.2）。
+/// ## 核心业务 API（经验报告·二.2 的四个端点）
 ///
-/// ## 课程匹配：从「我的课程」入手 + 核心课名分层匹配
+/// - `GET /api/v1/course/my-courses`（term_id/year）：本学期选修课列表；
+/// - `POST /api/v1/course/search`（keyword/page）：全局搜索候选课程；
+/// - `GET /api/v1/course/lesson-replay`（course_id）：回放小节
+///   （`sub_videos`：sub_id、录制时间、播放地址）。
 ///
-/// 数据源 `courseapi/v2/course-live/get-my-course-month?month=YYYY-MM`
-/// （Bearer），取上月/本月/下月覆盖学期边界。**智云后端是 PHP**：关联数组
-/// 序列化后 `list`/`course` 可能是 JSON Object（Map）而非 Array（List），
-/// 解析必须两种形态都兼容（空列表时又可能是 `[]`）。
-///
-/// 课程名匹配按经验文档的分层梯队：全等 → 核心课名（剥离「网络/线上/
-/// 双语/MOOC」等修饰符与班级号）相等 → 核心课名去符号后子串包含（长度
-/// ≥3）→ 教师辅助判定（多教师拆分后任一命中加分）。
-///
-/// ## 直达链接（用户实测确认的格式）
-///
+/// 播放间直达 URL（用户实测确认）：
 /// `https://classroom.zju.edu.cn/livingroom?course_id=<id>&sub_id=<sub_id>&tenant_code=112`
-/// 该页同时支持直播与回放；对整门课取迭代序最后一节（最近一节）。
+///
+/// ## 课程匹配（经验报告·三）
+///
+/// - `cleanCourseName` 规整括号、剥末尾班级号；`extractCoreCourseName`
+///   进一步剥教学方式修饰符（网络/线上/MOOC/研讨等）；
+/// - 梯队：等级/罗马数字冲突防御（甲≠乙、I≠II 直接 false，防串课）→
+///   归一化全等 → 核心课名相等 → 核心去符号子串包含（≥3）；
+/// - 多教师拆分后任一交叉命中者优先锁定本班课堂。
 class ClassroomService {
   ClassroomService._();
 
@@ -46,13 +44,14 @@ class ClassroomService {
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
   static const _casLoginUrl = 'https://zjuam.zju.edu.cn/cas/login';
-  static const _classroomCasCallback =
-      'https://classroom.zju.edu.cn/api/v1/cas/login';
-  static const _myCourseMonthUrl =
-      'https://classroom.zju.edu.cn/courseapi/v2/course-live/get-my-course-month';
+  static const _classroomBase = 'https://classroom.zju.edu.cn';
+  static const _classroomCasCallback = '$_classroomBase/api/v1/cas/login';
+  static const _myCoursesUrl = '$_classroomBase/api/v1/course/my-courses';
+  static const _searchUrl = '$_classroomBase/api/v1/course/search';
+  static const _lessonReplayUrl = '$_classroomBase/api/v1/course/lesson-replay';
 
-  /// Token 持久化 key（经验文档一.2：Token 有效期较长，内存 + 本地双缓存，
-  /// 只有 401 才重登）。存 originalWebPageBox，退出登录清缓存时一并清掉。
+  /// Token 持久化 key（经验报告：内存 + 本地双缓存，只有 401 才重登）。
+  /// 存 originalWebPageBox，退出登录清缓存时一并清掉。
   static const _tokenCacheKey = 'classroom_bearer_token';
 
   static _ClassroomSession? _session;
@@ -112,11 +111,11 @@ class ClassroomService {
     _matchCache.clear();
   }
 
-  /// 在智云课堂「我的课程」里解析本课程：匹配课程 + 课节数 + 最近一节。
+  /// 在智云课堂里解析本课程：匹配 + 回放小节 + 最近一节。
   ///
-  /// 返回 null 的三种情况调用方都应视为「不展示卡片」：我的课程里没有
-  /// 这门课（尚未上过课）、查找过程失败（如不在校园网）。账号里确实
-  /// 存在课节，才说明有直播/回放可看。
+  /// 返回 null 的三种情况调用方都应视为「不展示卡片」：我的课程/搜索里
+  /// 都没有这门课（尚未上过）、没有回放小节、查找过程失败（如不在校园
+  /// 网）。账号里确实存在回放小节，才说明可看。
   static Future<ClassroomMatch?> resolveCourse({
     required String courseName,
     String? teacher,
@@ -126,7 +125,7 @@ class ClassroomService {
     final cacheKey = '$courseName|$teacher';
     if (_matchCache.containsKey(cacheKey)) return _matchCache[cacheKey];
 
-    // zjuam CAS 登录偶发 8s 超时（诊断日志实测），失败后等 2 秒重试一次。
+    // zjuam CAS 登录偶发超时（诊断日志实测），失败后等 2 秒重试一次。
     _ClassroomSession session;
     try {
       session = await _ensureSession(username: username, password: password);
@@ -135,105 +134,87 @@ class ClassroomService {
       session = await _ensureSession(username: username, password: password);
     }
 
-    var lessons = await _fetchMyLessons(session);
-    if (lessons == null) {
-      // 401：token 失效，重登一次再试（经验文档「Token 失效自动刷新」）。
+    final teacherSet = _teachersOf(teacher);
+
+    // 候选来源一：我的课程（本学期选修课列表）。
+    var candidates = await _fetchMyCourses(session);
+    if (candidates == null) {
+      // 401：token 失效，重登一次再试（经验报告「Token 双层缓存与自愈」）。
       _forgetToken();
       session = await _ensureSession(username: username, password: password);
-      lessons = await _fetchMyLessons(session) ?? const <ClassroomLesson>[];
+      candidates = await _fetchMyCourses(session) ?? const [];
+    }
+    var matched = _pickBest(candidates, courseName, teacherSet);
+
+    // 候选来源二：全局搜索（多重关键词降级检索，经验报告二.4/三.4）。
+    if (matched == null) {
+      final keywords = <String>{
+        cleanCourseName(courseName),
+        extractCoreCourseName(courseName),
+      }..removeWhere((k) => k.isEmpty);
+      for (final keyword in keywords) {
+        final found = await _searchCourses(session, keyword) ?? const [];
+        matched = _pickBest(found, courseName, teacherSet);
+        if (matched != null) break;
+      }
     }
 
-    // 匹配按经验文档的分层梯队执行，取最高梯队的全部课节。
-    final target = _normalize(courseName);
-    final targetCore = extractCoreCourseName(courseName);
-    final teacherSet = _teachersOf(teacher);
-    final subIds = <int>{};
-    int? latestCourseId;
-    int? latestSubId;
-    String bestTitle = '';
-    String bestRealname = '';
-    var bestTier = 0;
+    if (matched == null) {
+      DiagnosticLogService.instance.record(
+        module: 'classroom',
+        operation: 'match',
+        message: '我的课程 ${candidates.length} 门与搜索均未命中「$courseName」',
+      );
+      _matchCache[cacheKey] = null;
+      return null;
+    }
 
-    for (final lesson in lessons) {
-      final remote = _normalize(lesson.title);
-      final remoteCore = extractCoreCourseName(lesson.title);
-      if (remote.isEmpty) continue;
-
-      var tier = 0;
-      if (remote == target) {
-        tier = 4; // 全等
-      } else if (targetCore.isNotEmpty && remoteCore == targetCore) {
-        tier = 3; // 核心课名相等
-      } else if (targetCore.length >= 3 &&
-          (remoteCore.contains(targetCore) ||
-              targetCore.contains(remoteCore))) {
-        tier = 2; // 核心课名子串包含
-      }
-      if (tier <= 0) continue;
-
-      if (teacherSet.isNotEmpty) {
-        final lecturer = _normalize(lesson.realname);
-        if (lecturer.isNotEmpty &&
-            teacherSet
-                .any((t) => lecturer.contains(t) || t.contains(lecturer))) {
-          tier += 1; // 教师辅助加分（多教师拆分后任一命中即可）
-        }
-      }
-
-      if (tier >= bestTier) {
-        if (tier > bestTier) {
-          bestTier = tier;
-          subIds.clear();
-        }
-        bestTitle = lesson.title;
-        bestRealname = lesson.realname;
-        subIds.add(lesson.subId);
-        latestCourseId = lesson.courseId;
-        latestSubId = lesson.subId;
-      }
+    // 回放小节：有 sub_videos 才展示卡片（尚未上课/回放未生成 → 隐藏）。
+    final subs = await _fetchLessonReplays(session, matched.courseId);
+    if (subs == null || subs.isEmpty) {
+      DiagnosticLogService.instance.record(
+        module: 'classroom',
+        operation: 'match',
+        message: '「${matched.title}」无回放小节，隐藏入口卡片',
+      );
+      _matchCache[cacheKey] = null;
+      return null;
     }
 
     DiagnosticLogService.instance.record(
       module: 'classroom',
       operation: 'match',
-      message: subIds.isEmpty
-          ? '我的课程共 ${lessons.length} 节，无「$courseName」的匹配'
-          : '我的课程共 ${lessons.length} 节，「$courseName」按梯队 $bestTier 命中 '
-              '${subIds.length} 节（course_id=$latestCourseId）',
+      message: '「$courseName」命中「${matched.title}」（course_id='
+          '${matched.courseId}），${subs.length} 节回放',
     );
-    if (latestCourseId == null || latestSubId == null || subIds.isEmpty) {
-      _matchCache[cacheKey] = null;
-      return null;
-    }
     final match = ClassroomMatch(
-      course: ClassroomCourse(
-        courseId: latestCourseId,
-        title: bestTitle,
-        realname: bestRealname,
-      ),
-      subCount: subIds.length,
-      latestSubId: latestSubId,
+      course: matched,
+      subCount: subs.length,
+      latestSubId: subs.last.subId,
+      latestSubTitle: subs.last.title,
     );
     _matchCache[cacheKey] = match;
     return match;
   }
 
-  /// 拉取上月/本月/下月的「我的课程」课节，按 subId 去重。
-  ///
-  /// token 失效（401）返回 null，由调用方重登后重试。
-  static Future<List<ClassroomLesson>?> _fetchMyLessons(
+  // ===== 候选课程来源 =====
+
+  /// GET /api/v1/course/my-courses——本学期选修课；401 返回 null。
+  static Future<List<ClassroomCourse>?> _fetchMyCourses(
       _ClassroomSession session) async {
     final now = DateTime.now();
-    final months = <String>{
-      _monthKey(DateTime(now.year, now.month - 1, 1)),
-      _monthKey(now),
-      _monthKey(DateTime(now.year, now.month + 1, 1)),
-    };
-    final lessons = <ClassroomLesson>[];
-    final seenSubIds = <int>{};
-    for (final month in months) {
-      final uri = Uri.parse(_myCourseMonthUrl)
-          .replace(queryParameters: {'month': month});
+    final yearStart = now.month >= DateTime.september ? now.year : now.year - 1;
+    // 秋冬学期（9 月起至次年 1 月）为第一学期，春夏为第二学期。
+    final termIndex =
+        (now.month >= DateTime.september || now.month == 1) ? 1 : 2;
+    final termId = '$yearStart-${yearStart + 1}-$termIndex';
+
+    final attempts = <Map<String, String>>[
+      {'term_id': termId, 'year': '$yearStart'},
+      const {},
+    ];
+    for (final query in attempts) {
+      final uri = Uri.parse(_myCoursesUrl).replace(queryParameters: query);
       final request = await session.httpClient.openUrl('GET', uri);
       request.headers.set('User-Agent', _userAgent);
       request.headers.set('Authorization', 'Bearer ${session.token}');
@@ -243,46 +224,166 @@ class ClassroomService {
           );
       if (response.statusCode == HttpStatus.unauthorized) {
         await response.drain<void>();
-        return null; // token 失效
+        return null;
       }
       final body = await response.transform(utf8.decoder).join();
-      final payload = decodeJsonMap(body, context: '智云课堂我的课程');
-
-      // PHP 后端：list 可能是 Array，也可能（历史数据/空表）是 Object。
-      for (final rawDay in _iterableOf(payload['list'])) {
-        final day = asStringMap(rawDay);
-        if (day == null) continue;
-        for (final rawLesson in _iterableOf(day['course'])) {
-          final lesson = asStringMap(rawLesson);
-          if (lesson == null) continue;
-          final courseId = _asId(lesson['id']);
-          final subId = _asId(lesson['sub_id']);
-          if (courseId == null || subId == null || seenSubIds.contains(subId)) {
-            continue;
-          }
-          seenSubIds.add(subId);
-          lessons.add(ClassroomLesson(
-            courseId: courseId,
-            subId: subId,
-            title: (asString(lesson['title']) ?? '').trim(),
-            subTitle: (asString(lesson['sub_title']) ?? '').trim(),
-            realname: (asString(lesson['realname']) ?? '').trim(),
-          ));
-        }
+      if (response.statusCode != HttpStatus.ok) {
+        continue; // 参数形态不对等场景：换下一组查询参数。
       }
+      final payload = decodeJsonMap(body, context: '智云课堂我的课程');
+      final courses = <ClassroomCourse>[];
+      for (final raw in _iterableOf(payload['courses'])) {
+        final course = _courseFromJson(raw);
+        if (course != null) courses.add(course);
+      }
+      if (courses.isNotEmpty) return courses;
     }
-    return lessons;
-  }
-
-  /// PHP 关联数组兼容：List 直接用，Map 取 values（见类文档「课程匹配」）。
-  static Iterable<Object?> _iterableOf(Object? raw) {
-    if (raw is List) return raw;
-    if (raw is Map) return raw.values;
     return const [];
   }
 
-  static String _monthKey(DateTime date) =>
-      '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}';
+  /// POST /api/v1/course/search——全局搜索；401 返回 null。
+  static Future<List<ClassroomCourse>?> _searchCourses(
+      _ClassroomSession session, String keyword) async {
+    final uri = Uri.parse(_searchUrl).replace(queryParameters: {'page': '1'});
+    final request = await session.httpClient.openUrl('POST', uri);
+    request.headers.set('User-Agent', _userAgent);
+    request.headers.set('Authorization', 'Bearer ${session.token}');
+    request.headers.contentType = ContentType.json;
+    request.write(jsonEncode({'keyword': keyword, 'page': 1}));
+    final response = await request.close().timeout(
+          const Duration(seconds: 8),
+          onTimeout: () => throw requestTimeout(),
+        );
+    if (response.statusCode == HttpStatus.unauthorized) {
+      await response.drain<void>();
+      return null;
+    }
+    final body = await response.transform(utf8.decoder).join();
+    final payload = decodeJsonMap(body, context: '智云课堂搜索');
+    final courses = <ClassroomCourse>[];
+    for (final raw in _iterableOf(payload['list'])) {
+      final course = _courseFromJson(raw);
+      if (course != null) courses.add(course);
+    }
+    return courses;
+  }
+
+  /// 宽松字段抽取：course_id/id、title/name、teacher/realname/lecturer。
+  static ClassroomCourse? _courseFromJson(Object? raw) {
+    final map = asStringMap(raw);
+    if (map == null) return null;
+    final courseId = _asId(map['course_id'] ?? map['id']);
+    if (courseId == null || courseId <= 0) return null;
+    final title =
+        (asString(map['title']) ?? asString(map['name']) ?? '').trim();
+    if (title.isEmpty) return null;
+    final teacher = (asString(map['teacher']) ??
+            asString(map['realname']) ??
+            asString(map['lecturer']) ??
+            '')
+        .trim();
+    return ClassroomCourse(
+      courseId: courseId,
+      title: title,
+      realname: teacher,
+    );
+  }
+
+  /// GET /api/v1/course/lesson-replay——回放小节；401 返回 null。
+  static Future<List<ClassroomReplaySub>?> _fetchLessonReplays(
+      _ClassroomSession session, int courseId) async {
+    final uri = Uri.parse(_lessonReplayUrl)
+        .replace(queryParameters: {'course_id': '$courseId'});
+    final request = await session.httpClient.openUrl('GET', uri);
+    request.headers.set('User-Agent', _userAgent);
+    request.headers.set('Authorization', 'Bearer ${session.token}');
+    final response = await request.close().timeout(
+          const Duration(seconds: 8),
+          onTimeout: () => throw requestTimeout(),
+        );
+    if (response.statusCode == HttpStatus.unauthorized) {
+      await response.drain<void>();
+      return null;
+    }
+    final body = await response.transform(utf8.decoder).join();
+    final payload = decodeJsonMap(body, context: '智云课堂回放小节');
+    final subs = <ClassroomReplaySub>[];
+    for (final raw in _iterableOf(payload['sub_videos'])) {
+      final map = asStringMap(raw);
+      if (map == null) continue;
+      final subId = _asId(map['sub_id'] ?? map['id']);
+      if (subId == null || subId <= 0) continue;
+      subs.add(ClassroomReplaySub(
+        subId: subId,
+        title:
+            (asString(map['sub_title']) ?? asString(map['title']) ?? '').trim(),
+        recordedAt: _parseTime(map['record_time'] ??
+            map['recordTime'] ??
+            map['time'] ??
+            map['created_at'] ??
+            map['start_time']),
+      ));
+    }
+    // 按录制时间升序（缺时间的排最前），迭代序最后一节即最近一节。
+    subs.sort((a, b) {
+      final at = a.recordedAt, bt = b.recordedAt;
+      if (at != null && bt != null) return at.compareTo(bt);
+      if (at != null) return 1;
+      if (bt != null) return -1;
+      return 0;
+    });
+    return subs;
+  }
+
+  static DateTime? _parseTime(Object? raw) {
+    if (raw == null) return null;
+    return DateTime.tryParse(raw.toString().trim())?.toLocal();
+  }
+
+  static String _normalize(String input) =>
+      input.replaceAll(RegExp(r'\s+'), '').trim();
+
+  static int? _asId(Object? value) {
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    return int.tryParse(value?.toString().trim() ?? '');
+  }
+
+  /// 教务教师字段拆分：`张三,李四` / `张三/李四` / `张三、李四` 均可。
+  static Set<String> _teachersOf(String? teacher) {
+    if (teacher == null || teacher.trim().isEmpty) return const {};
+    return teacher
+        .split(RegExp(r'[,，/、;；]'))
+        .map(_normalize)
+        .where((t) => t.isNotEmpty)
+        .toSet();
+  }
+
+  /// 梯队匹配 + 教师交叉校验，返回最优候选（经验报告三.2）。
+  static ClassroomCourse? _pickBest(List<ClassroomCourse> candidates,
+      String courseName, Set<String> teacherSet) {
+    ClassroomCourse? best;
+    var bestScore = -1;
+    for (final candidate in candidates) {
+      if (!matchesCourseName(
+          courseName, candidate.title, teacherSet, candidate.realname)) {
+        continue;
+      }
+      // 同分时教师交叉命中的优先，其次保持先到先得。
+      var score = 1;
+      final lecturer = _normalize(candidate.realname);
+      if (teacherSet.isNotEmpty &&
+          lecturer.isNotEmpty &&
+          teacherSet.any((t) => lecturer.contains(t) || t.contains(lecturer))) {
+        score = 2;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        best = candidate;
+      }
+    }
+    return best;
+  }
 
   // ===== 登录：CAS service 票据直换智云 token =====
 
@@ -389,71 +490,133 @@ class ClassroomService {
     return flat.length > 200 ? flat.substring(0, 200) : flat;
   }
 
-  static String _normalize(String input) =>
-      input.replaceAll(RegExp(r'\s+'), '').trim();
-
-  static int? _asId(Object? value) {
-    if (value is int) return value;
-    if (value is num) return value.toInt();
-    return int.tryParse(value?.toString().trim() ?? '');
-  }
-
-  /// 教务教师字段拆分：`张三,李四` / `张三/李四` / `张三、李四` 均可。
-  static Set<String> _teachersOf(String? teacher) {
-    if (teacher == null || teacher.trim().isEmpty) return const {};
-    return teacher
-        .split(RegExp(r'[,，/、;；]'))
-        .map(_normalize)
-        .where((t) => t.isNotEmpty)
-        .toSet();
+  /// PHP 关联数组兼容：List 直接用，Map 取 values（经验报告三.4）。
+  static Iterable<Object?> _iterableOf(Object? raw) {
+    if (raw is List) return raw;
+    if (raw is Map) return raw.values;
+    return const [];
   }
 }
 
-/// 提取核心课名（经验文档「课程匹配核心算法」）：
-/// 统一全角括号为半角 → 剥离教学方式修饰符（网络/线上/双语/MOOC 等）与
-/// 班级号（01班/[01]/【02】）→ 去空白。保留等级与罗马数字（如 微积分（甲）I）。
+/// 梯队式课程名匹配（经验报告三.2「matchesCourseName」）。
+///
+/// Tier 1 等级/罗马数字冲突防御（甲≠乙、I≠II 直接 false，防串课）；
+/// Tier 2 归一化完全相等；Tier 3 核心课名相等；Tier 4 特殊学科（Python、
+/// 大学英语分级）；Tier 5 宽松子串包含（核心词 ≥3）。[remoteTeacher]
+/// 非空时做教师交叉校验：同名单任一教师命中即可，多教师拆分后比对。
+bool matchesCourseName(
+    String localName, String remoteName, Set<String> teacherSet,
+    [String remoteTeacher = '']) {
+  final cleanedLocal = cleanCourseName(localName);
+  final cleanedRemote = cleanCourseName(remoteName);
+  final coreLocal = extractCoreCourseName(localName);
+  final coreRemote = extractCoreCourseName(remoteName);
+  if (coreLocal.isEmpty || coreRemote.isEmpty) return false;
+
+  // Tier 1：等级与罗马数字冲突防御。
+  final localGrade = _gradeTag(coreLocal);
+  final remoteGrade = _gradeTag(coreRemote);
+  if (localGrade != null && remoteGrade != null && localGrade != remoteGrade) {
+    return false;
+  }
+  final localRoman = _romanTag(coreLocal);
+  final remoteRoman = _romanTag(coreRemote);
+  if (localRoman != null && remoteRoman != null && localRoman != remoteRoman) {
+    return false;
+  }
+
+  // Tier 2：归一化完全相等。
+  if (_stripSymbols(cleanedLocal) == _stripSymbols(cleanedRemote)) return true;
+
+  // Tier 3：核心课名相等。
+  if (_stripSymbols(coreLocal) == _stripSymbols(coreRemote)) return true;
+
+  // Tier 4：特殊学科——大学英语分级（级别一致即视为同课）。
+  if (_collegeEnglishLevel(coreLocal) != null &&
+      _collegeEnglishLevel(coreLocal) == _collegeEnglishLevel(coreRemote)) {
+    return true;
+  }
+
+  // Tier 5：宽松子串包含（核心词 ≥3）。
+  if (coreLocal.length >= 3 &&
+      (coreRemote.contains(coreLocal) || coreLocal.contains(coreRemote))) {
+    return true;
+  }
+
+  // 教师交叉兜底：课名包含且任一教师命中（同名多班场景）。
+  final lecturer = remoteTeacher.replaceAll(RegExp(r'\s+'), '').trim();
+  if (coreLocal.length >= 3 &&
+      (coreRemote.contains(coreLocal) || coreLocal.contains(coreRemote)) &&
+      teacherSet.isNotEmpty &&
+      lecturer.isNotEmpty &&
+      teacherSet.any((t) => lecturer.contains(t) || t.contains(lecturer))) {
+    return true;
+  }
+  return false;
+}
+
+String _stripSymbols(String input) =>
+    input.replaceAll(RegExp(r'[^0-9A-Za-z\u4e00-\u9fa5]'), '');
+
+String? _gradeTag(String name) {
+  final m = RegExp(r'[([](甲|乙|丙|丁|戊)[)]').firstMatch(name);
+  return m?.group(1);
+}
+
+String? _romanTag(String name) {
+  final m = RegExp(r'(I{1,3}|IV|V)$').firstMatch(name.trim());
+  return m?.group(1);
+}
+
+String? _collegeEnglishLevel(String name) {
+  final m = RegExp(r'大学英语\s*(I{1,3}|IV|V|[1-5])').firstMatch(name);
+  return m?.group(1);
+}
+
+/// 基础清洗（经验报告三.1 `cleanCourseName`）：规整括号、剥末尾班级号。
+String cleanCourseName(String courseName) {
+  var cleaned = courseName.trim();
+  cleaned = cleaned.replaceAll('（', '(').replaceAll('）', ')');
+  cleaned = cleaned.replaceAll('【', '[').replaceAll('】', ']');
+  cleaned = cleaned.replaceAll(RegExp(r'[\(\[]\s*\d+\s*(班)?\s*[\)\]]$'), '');
+  cleaned = cleaned.replaceAll(RegExp(r'-\d+$'), '');
+  return cleaned.trim();
+}
+
+/// 深度提取核心课名（经验报告三.1 `extractCoreCourseName`）：
+/// 剥荣誉/教学模式修饰符与班级号，保留等级与罗马数字。
 String extractCoreCourseName(String name) {
-  var result = name.replaceAll('（', '(').replaceAll('）', ')');
-  result = result.replaceAll(
-      RegExp(r'[((](?:网络|线上|线下|双语|全英文|英文|MOOC|慕课|网课)[))]',
+  var s = name.trim();
+  s = s.replaceAll(
+      RegExp(r'[((]\s*(?:荣誉|honor)\s*[)\]]', caseSensitive: false), '');
+  s = s.replaceAll('（', '(').replaceAll('）', ')');
+  s = s.replaceAll('【', '[').replaceAll('】', ']');
+  s = s.replaceAll(
+      RegExp(
+          r'[\(\[]\s*(网络|线上|线下|双语|全英文|英文|mooc|MOOC|慕课|研讨|实验|翻转|理论|通识|通识核心|选修|必修)\s*[\)\]]',
           caseSensitive: false),
       '');
-  result = result.replaceAll(RegExp(r'[([](?:\d{1,2})班[)\]]'), '');
-  result = result.replaceAll(RegExp(r'[[【]\d{1,3}[】\]]'), '');
-  result = result.replaceAll(RegExp(r'\s+'), '');
-  return result.trim();
+  s = s.replaceAll(RegExp(r'[\(\[]\s*\d+\s*(班)?\s*[\)\]]'), '');
+  s = s.replaceAll(RegExp(r'-\d+$'), '');
+  return s.trim();
 }
 
-/// 一次成功解析的智云课堂课程：匹配条目 + 课节数 + 最近一节。
+/// 一次成功解析的智云课堂课程：匹配条目 + 回放小节数 + 最近一节。
 class ClassroomMatch {
   final ClassroomCourse course;
   final int subCount;
   final int latestSubId;
+  final String latestSubTitle;
 
   const ClassroomMatch({
     required this.course,
     required this.subCount,
     required this.latestSubId,
+    this.latestSubTitle = '',
   });
 }
 
-/// 「我的课程」里的一条课节（一次上课对应一个 sub_id）。
-class ClassroomLesson {
-  final int courseId;
-  final int subId;
-  final String title;
-  final String subTitle;
-  final String realname;
-
-  const ClassroomLesson({
-    required this.courseId,
-    required this.subId,
-    required this.title,
-    required this.subTitle,
-    required this.realname,
-  });
-}
-
+/// 「我的课程」/搜索里的一条候选课程。
 class ClassroomCourse {
   final int courseId;
   final String title;
@@ -463,6 +626,19 @@ class ClassroomCourse {
     required this.courseId,
     required this.title,
     required this.realname,
+  });
+}
+
+/// lesson-replay 里的一条回放小节。
+class ClassroomReplaySub {
+  final int subId;
+  final String title;
+  final DateTime? recordedAt;
+
+  const ClassroomReplaySub({
+    required this.subId,
+    required this.title,
+    required this.recordedAt,
   });
 }
 
