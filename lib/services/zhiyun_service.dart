@@ -44,9 +44,11 @@ class ZhiyunService {
   static const _userAgent =
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
-  static const _casLoginUrl = 'https://zjuam.zju.edu.cn/cas/login';
+  static const _ssoEntryUrl =
+      'https://tgmedia.cmc.zju.edu.cn/index.php?r=auth/login&auType=cmc'
+      '&tenant_code=112&forward=https%3A%2F%2Fclassroom.zju.edu.cn%2F';
+  static const _maxRedirectHops = 24;
   static const _zhiyunBase = 'https://classroom.zju.edu.cn';
-  static const _zhiyunCasCallback = '$_zhiyunBase/api/v1/cas/login';
   static const _userInfoUrl = '$_zhiyunBase/api/v1/user/info';
   static const _myCoursesUrl = '$_zhiyunBase/api/v1/course/my-courses';
   static const _searchUrl = '$_zhiyunBase/api/v1/course/search';
@@ -104,74 +106,132 @@ class ZhiyunService {
     if (iPlanet == null) {
       throw const ZhiyunException('统一认证未登录');
     }
-    final service = Uri.encodeComponent(_zhiyunCasCallback);
-    final casUri = Uri.parse('$_casLoginUrl?service=$service');
+    final jar = ZhiyunCookieJar();
+    // iPlanet 挂父域：SSO 链会经过 zjuam/通行证(zuinfo) 等浙大系主机，
+    // 统一挂到 zju.edu.cn 让全链都能带上凭据。
+    jar.set('zju.edu.cn', iPlanet.name, iPlanet.value);
 
-    for (var attempt = 0; attempt < 2; attempt++) {
-      if (attempt > 0) {
-        iPlanet = await ZjuAm.getSsoCookie(_client, username, password);
-        if (iPlanet == null) throw const ZhiyunException('统一认证重登失败');
-      }
-      final cookie = iPlanet!;
-      final request = await _client.openUrl('GET', casUri).timeout(
+    var currentUrl = Uri.parse(_ssoEntryUrl);
+    var reachedClassroom = false;
+    var lastBody = '';
+    for (var hop = 0; hop < _maxRedirectHops; hop++) {
+      final request = await _client.openUrl('GET', currentUrl).timeout(
             const Duration(seconds: 10),
             onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
           );
       request.followRedirects = false;
       request.headers.set('User-Agent', _userAgent);
-      request.cookies.add(Cookie(cookie.name, cookie.value));
+      for (final cookie in jar.cookiesFor(currentUrl)) {
+        request.cookies.add(cookie);
+      }
       final response = await request.close().timeout(
             const Duration(seconds: 10),
             onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
           );
-      final location = response.headers.value(HttpHeaders.locationHeader);
-      if (response.statusCode == HttpStatus.movedTemporarily &&
-          location != null &&
-          location.contains('ticket=')) {
-        await response.drain<void>();
-        return _exchangeTokenWithTicket(location);
+      for (final raw
+          in response.headers[HttpHeaders.setCookieHeader] ?? <String>[]) {
+        jar.store(currentUrl, raw);
       }
-      await response.drain<void>();
-      if (attempt == 0) {
-        // iPlanet 已失效：作废统一认证缓存 cookie，强制重新登录。
-        await ZjuAm.clearCachedSsoCookie(username);
-        continue;
-      }
-      throw ZhiyunException('统一认证会话无效（CAS ${response.statusCode}，未取得票据）');
-    }
-    throw const ZhiyunException('未能取得智云课堂票据');
-  }
+      final body = await response.transform(utf8.decoder).join();
 
-  /// 携带 ST 票据访问智云回调，取响应 JSON 的 data.token。
-  static Future<String> _exchangeTokenWithTicket(String callbackUrl) async {
-    var url = Uri.parse(callbackUrl);
-    String body = '';
-    for (var hop = 0; hop < 5; hop++) {
-      final request = await _client.openUrl('GET', url).timeout(
-            const Duration(seconds: 10),
-            onTimeout: () => throw const ZhiyunException('智云回调请求超时'),
-          );
-      request.followRedirects = hop < 4;
-      request.headers.set('User-Agent', _userAgent);
-      final response = await request.close().timeout(
-            const Duration(seconds: 10),
-            onTimeout: () => throw const ZhiyunException('智云回调请求超时'),
-          );
-      body = await response.transform(utf8.decoder).join();
-      final next = response.headers.value(HttpHeaders.locationHeader);
-      if (next != null && next.isNotEmpty) {
-        url = url.resolve(next);
+      final target = _nextRedirectTarget(currentUrl, response, body);
+      if (target != null) {
+        currentUrl = target;
         continue;
       }
+      reachedClassroom = currentUrl.host == 'classroom.zju.edu.cn' ||
+          body.contains('classroom.zju.edu.cn') ||
+          body.contains('_token');
+      lastBody = body;
       break;
     }
-    final payload = decodeJsonMap(body, context: '智云课堂 CAS 回调');
-    final data = asStringMap(payload['data']);
-    final token = (asString(data?['token']) ?? '').trim();
-    if (token.isEmpty) {
-      throw const ZhiyunException('智云课堂 CAS 回调未下发 token');
+
+    if (!reachedClassroom) {
+      final snippet = lastBody.length > 160
+          ? lastBody.substring(0, 160).replaceAll("\n", " ")
+          : lastBody;
+      DiagnosticLogService.instance.record(
+        module: 'zhiyun',
+        operation: 'ssoStuck',
+        message: 'SSO 未完成，停留在 ${currentUrl.host}',
+        error: snippet,
+      );
+      throw ZhiyunException('智云课堂 SSO 未完成（停留在 ${currentUrl.host}）；需校园网/VPN 访问');
+    }
+
+    // 首页预热，确保 classroom 域会话 cookie 齐全。
+    final warmUp = await _client.openUrl('GET', Uri.parse('$_zhiyunBase/'));
+    warmUp.followRedirects = true;
+    warmUp.headers.set('User-Agent', _userAgent);
+    for (final cookie in jar.cookiesFor(Uri.parse('$_zhiyunBase/'))) {
+      warmUp.cookies.add(cookie);
+    }
+    final warmUpResponse = await warmUp.close().timeout(
+          const Duration(seconds: 10),
+          onTimeout: () => throw const ZhiyunException('智云课堂请求超时'),
+        );
+    await warmUpResponse.drain<void>();
+
+    final token = jar.tokenFor('classroom.zju.edu.cn');
+    if (token == null || token.isEmpty) {
+      throw const ZhiyunException('智云课堂登录态缺失（_token cookie 未下发）');
     }
     return token;
+  }
+
+  /// 从重定向响应里解析下一跳：Location 头 → Refresh 头 → HTML/JS 内联。
+  static Uri? _nextRedirectTarget(
+      Uri current, HttpClientResponse response, String body) {
+    final location = response.headers.value(HttpHeaders.locationHeader);
+    final resolved = _resolveRedirect(current, location);
+    if (resolved != null) return resolved;
+
+    final refresh = response.headers.value('refresh');
+    if (refresh != null) {
+      for (final part in refresh.split(';')) {
+        final t = part.trim();
+        if (t.toLowerCase().startsWith('url=')) {
+          final resolvedRefresh = _resolveRedirect(current, t.substring(4));
+          if (resolvedRefresh != null) return resolvedRefresh;
+        }
+      }
+    }
+
+    final patterns = [
+      RegExp(r'''url=([^"'\s>]+)''', caseSensitive: false),
+      RegExp(r'''location\.href\s*=\s*["']([^"']+["'])'''),
+      RegExp(r'''window\.location\s*=\s*["']([^"']+)['"]'''),
+      RegExp(r'''window\.location\.replace\(["']([^"']+)["']\)'''),
+      RegExp(r'''location\.replace\(["']([^"']+)["']\)'''),
+      RegExp(
+          r'''(?:top|self|parent)\.location(?:\.href)?\s*=\s*["']([^"']+)['"]'''),
+    ];
+    for (final pattern in patterns) {
+      final match = pattern.firstMatch(body);
+      if (match != null) {
+        final resolvedHtml = _resolveRedirect(current, match.group(1));
+        if (resolvedHtml != null) return resolvedHtml;
+      }
+    }
+    return null;
+  }
+
+  static Uri? _resolveRedirect(Uri current, String? target) {
+    if (target == null) return null;
+    var trimmed = target.trim();
+    if (trimmed.length >= 2) {
+      final first = trimmed[0];
+      final last = trimmed[trimmed.length - 1];
+      if ((first == '"' && last == '"') || (first == "'" && last == "'")) {
+        trimmed = trimmed.substring(1, trimmed.length - 1).trim();
+      }
+    }
+    if (trimmed.isEmpty) return null;
+    try {
+      return current.resolve(trimmed);
+    } on FormatException {
+      return Uri.tryParse(trimmed);
+    }
   }
 
   /// 自愈：清空双层缓存（401 / token 失效时调用）。
@@ -684,4 +744,88 @@ bool matchesCourseName(
     return true;
   }
   return false;
+}
+
+/// 极简 cookie 罐：按域名归档，请求时带上域名后缀匹配的所有 cookie。
+class ZhiyunCookieJar {
+  final Map<String, Map<String, String>> _store = {};
+
+  void set(String host, String name, String value) {
+    _store.putIfAbsent(host, () => {})[name] = value;
+  }
+
+  /// 解析并归档一条 Set-Cookie；带 Domain 属性的按父域归档。
+  void store(Uri requestUri, String raw) {
+    final segments = raw.split(';');
+    if (segments.isEmpty) return;
+    final pair = segments.first;
+    final eq = pair.indexOf('=');
+    if (eq <= 0) return;
+    final name = pair.substring(0, eq).trim();
+    var value = pair.substring(eq + 1).trim();
+    var host = requestUri.host;
+    for (final attr in segments.skip(1)) {
+      final attrPair = attr.trim();
+      if (attrPair.toLowerCase().startsWith('domain=')) {
+        var domain = attrPair.substring(7).trim();
+        if (domain.startsWith('.')) domain = domain.substring(1);
+        if (domain.isNotEmpty) host = domain;
+      }
+    }
+    if (name.isEmpty) return;
+    if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+      value = value.substring(1, value.length - 1);
+    }
+    set(host, name, value);
+  }
+
+  List<Cookie> cookiesFor(Uri requestUri) {
+    final host = requestUri.host;
+    final result = <Cookie>[];
+    _store.forEach((domain, cookies) {
+      if (host == domain || host.endsWith('.$domain')) {
+        cookies.forEach((name, value) {
+          result.add(Cookie(name, value));
+        });
+      }
+    });
+    return result;
+  }
+
+  /// 取 host 及其父域下的 `_token` cookie：先原样、再百分号解码、
+  /// 再 PHP 序列化兜底。
+  String? tokenFor(String host) {
+    String? raw;
+    for (final entry in _store.entries) {
+      if (raw != null) break;
+      final domain = entry.key;
+      if (host == domain || host.endsWith('.$domain')) {
+        final value = entry.value['_token'];
+        if (value != null && value.isNotEmpty) raw = value;
+      }
+    }
+    if (raw == null) return null;
+    final candidates = <String>[raw];
+    try {
+      candidates.add(Uri.decodeComponent(raw));
+    } on ArgumentError {
+      // 非法百分号编码就跳过解码分支。
+    }
+    final serialized = RegExp(r'\{i:\d+;s:\d+:"_token";i:\d+;s:\d+:"(.+?)";\}');
+    for (final candidate in candidates) {
+      var direct = candidate.trim();
+      if (direct.length >= 2 &&
+          direct.startsWith('"') &&
+          direct.endsWith('"')) {
+        direct = direct.substring(1, direct.length - 1).trim();
+      }
+      if (direct.isNotEmpty && !direct.contains(';s:')) return direct;
+      final match = serialized.firstMatch(candidate);
+      if (match != null) {
+        final inner = match.group(1);
+        if (inner != null && inner.trim().isNotEmpty) return inner.trim();
+      }
+    }
+    return null;
+  }
 }
