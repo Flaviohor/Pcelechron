@@ -23,10 +23,13 @@ import 'package:get/get.dart';
 /// 1. `zjuam/cas/login?service=<tgmedia 认证入口>` 取登录表单（execution
 ///    与 JSESSIONID 绑定）；
 /// 2. RSA 公钥加密密码后携 service 提交，CAS 校验通过即 302 跳回
-///    tgmedia 并下发新 iPlanet（1.3.5.12 实测：Location 不带 ticket——
-///    tgmedia 挂 OpenAM Agent，认 iPlanetDirectoryPro 而非 CAS 票据）；
-/// 3. 凭新 iPlanet 从 tgmedia 入口起跳：Agent 校验通过后 forward 到
-///    classroom，会话落成 `_token` cookie；
+///    tgmedia 并下发登录会话 Cookie（1.3.5.12 实测 Location 不带
+///    ticket——tgmedia 挂 OpenAM Agent，认 iPlanetDirectoryPro）；
+/// 3. 凭全套会话 Cookie 从 tgmedia 入口起跳（1.3.5.15 逐跳日志实测）：
+///    Agent 放行 → tgmedia 首页 → yjapi casapi → zjuam CAS
+///    OAuth2.0/authorize（此处认登录签发的 CASTGC，缺了会被踢回登录
+///    表单）→ 带 code 一路走回 tgmedia/classroom，会话落成 `_token`
+///    cookie；
 /// 4. 之后所有智云 API 携带 `Authorization: Bearer <token>`。
 ///
 /// 网络层：校外部分线路到 classroom/tgmedia 等真实 IP 被黑洞，
@@ -114,25 +117,32 @@ class ZhiyunService {
     return token;
   }
 
-  /// CAS 静默换票：带 service 的一次性完整登录（浏览器同款）→ 302 带票 →
-  /// tgmedia 回调 → classroom `_token` cookie。
+  /// CAS 静默换票：带 service 的一次性完整登录（浏览器同款）→ 凭全套
+  /// 登录会话 Cookie 从 tgmedia 入口起链 → classroom `_token` cookie。
   ///
-  /// 携 iPlanet 复用换票的老路已被向 Keycloak 迁移中的 CAS 废弃
-  /// （1.3.5.11 实测「CAS 未签发智云票据」），因此直接用账号密码走带
-  /// service 的登录 POST，票据取自登录响应的 302 Location。
+  /// 链路（1.3.5.15 逐跳日志实测）：tgmedia Agent 放行 → tgmedia 首页 →
+  /// yjapi casapi → zjuam CAS OAuth2.0/authorize → 带 code 回走 →
+  /// classroom。其中 authorize 认登录 POST 签发的 CASTGC；只带 iPlanet
+  /// 会被踢回登录表单，链路卡死。
   static Future<String> _loginZhiyunCas(
       String username, String password) async {
-    final (iPlanet, ticketCallback) = await _loginForZhiyunTicket(
-        username, password);
+    final (sessionCookies, chainStart) =
+        await _loginForZhiyunTicket(username, password);
 
     final jar = ZhiyunCookieJar();
-    if (iPlanet != null) {
-      // iPlanet 挂父域：SSO 链会经过 zjuam/通行证(zuinfo) 等浙大系主机，
-      // 统一挂到 zju.edu.cn 让全链都能带上凭据。
-      jar.set('zju.edu.cn', iPlanet.name, iPlanet.value);
+    for (final cookie in sessionCookies) {
+      if (cookie.name == 'iPlanetDirectoryPro') {
+        // iPlanet 挂父域：tgmedia 等挂 OpenAM Agent 的主机靠它建会话。
+        jar.set('zju.edu.cn', cookie.name, cookie.value);
+      } else {
+        // 其余（CASTGC 等 CAS 会话）按签发域归档：authorize 静默放行
+        // 需要，但不外泄给链路上的其它浙大主机。
+        jar.set(cookie.domain ?? 'zjuam.zju.edu.cn', cookie.name,
+            cookie.value);
+      }
     }
 
-    var currentUrl = ticketCallback;
+    var currentUrl = chainStart;
     var reachedClassroom = false;
     var lastBody = '';
     // 链路总时限：逐跳超时管得住单跳，管不住「跳得慢」的重定向环。
@@ -142,10 +152,23 @@ class ZhiyunService {
         throw ZhiyunException(
             '智云课堂登录链路超时（已 $hop 跳，停留在 ${currentUrl.host}）');
       }
-      final request = await _client.openUrl('GET', currentUrl).timeout(
-            const Duration(seconds: 10),
-            onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
-          );
+      final HttpClientRequest request;
+      try {
+        request = await _client.openUrl('GET', currentUrl).timeout(
+              const Duration(seconds: 10),
+              onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
+            );
+      } on SocketException catch (error) {
+        // DNS 失效域名（如已下线的通行证 zuinfo）不再以裸 SocketException
+        // 形态漏到卡片，翻译成可读文案并留诊断。
+        DiagnosticLogService.instance.record(
+          module: 'zhiyun',
+          operation: 'ssoHopError',
+          requestUri: currentUrl,
+          error: error,
+        );
+        throw ZhiyunException('无法解析或连接 ${currentUrl.host}；需校园网/VPN');
+      }
       request.followRedirects = false;
       request.headers.set('User-Agent', _userAgent);
       for (final cookie in jar.cookiesFor(currentUrl)) {
@@ -221,7 +244,7 @@ class ZhiyunService {
 
   /// 一次性带 service 的统一认证登录；把 ZjuAm 的异常翻译成卡片可展示的
   /// 单行短句（细节已由诊断日志记录）。
-  static Future<(Cookie?, Uri)> _loginForZhiyunTicket(
+  static Future<(List<Cookie>, Uri)> _loginForZhiyunTicket(
       String username, String password) async {
     try {
       return await ZjuAm.loginForServiceCallback(

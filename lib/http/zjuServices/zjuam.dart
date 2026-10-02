@@ -189,7 +189,7 @@ class ZjuAm {
       );
 
   /// 一次性「带 service 的完整密码登录」（浏览器同款），返回
-  /// `(iPlanetDirectoryPro 会话 Cookie, 起链回调 URI)`。
+  /// `(登录会话 Cookie 列表, 起链回调 URI)`。
   ///
   /// 为什么不复用 iPlanet 换票：2026-10 起统一认证向 Keycloak（Wisdomgarden
   /// SSO）迁移，携 iPlanet GET /cas/login?service=... 不再稳定签发票据
@@ -197,12 +197,11 @@ class ZjuAm {
   /// 而带 service 的登录 POST 实测通过 service 白名单（垃圾凭据返回密码
   /// 错误表单，而非「未认证授权服务」页）。
   ///
-  /// 登录成功的两种 302 形态（1.3.5.12 实测后者）：
-  /// a) Location 带 `ticket=`：标准 CAS 票据回调，原样返回；
-  /// b) 无票跳回 service 主机：tgmedia 这类挂 OpenAM Agent 的应用认
-  ///    iPlanetDirectoryPro，登录成功即 302 回应用，此时返回 service 入口
-  ///    本身，由调用方凭 iPlanet 走完后续跳转链。
-  static Future<(Cookie?, Uri)> loginForServiceCallback(
+  /// 返回的是登录 POST 下发的**全部**会话 Cookie（iPlanetDirectoryPro +
+  /// CASTGC 等）：tgmedia 的 OpenAM Agent 认 iPlanet，而后续的
+  /// zjuam CAS OAuth2.0/authorize 认 CASTGC（1.3.5.15 实测：只带 iPlanet
+  /// 时 authorize 被踢回登录表单，链路卡死）。由调用方按域归档。
+  static Future<(List<Cookie>, Uri)> loginForServiceCallback(
     HttpClient httpClient,
     String username,
     String password,
@@ -326,23 +325,33 @@ class ZjuAm {
       );
 
       if (iPlanet != null) {
-        // 登录成功——重构后唯一判据：CAS 校验凭据并签发 iPlanet 即算登录，
-        // 不再猜测 302 Location 的形态（1.3.5.13 曾因宿主比对误判失败）。
-        // 跳转目标：
-        // - Location 带 ticket=：标准 CAS 票据回调，原样起链；
-        // - 其余一律从 service 入口起链——tgmedia 挂 OpenAM Agent，认
-        //   iPlanetDirectoryPro 而非票据（1.3.5.12 实测其 302 无票），
-        //   携新 iPlanet 重访入口即可被 Agent 接收。
-        if (iPlanet.domain == null || iPlanet.domain!.trim().isEmpty) {
-          iPlanet.domain = 'zju.edu.cn';
+        // 登录成功——判据只看一件事：CAS 校验凭据并签发了 iPlanet，
+        // 不再猜测 302 Location 形态（1.3.5.13 曾因宿主比对误判失败）。
+        // 跳转目标：Location 带 ticket= 走票据回调；其余从 service 入口
+        // 起链（tgmedia 的 OpenAM Agent 认 iPlanet，302 无票）。
+        final sessionCookies = <Cookie>[];
+        for (final cookie in response.cookies) {
+          if (cookie.name.trim().isEmpty || cookie.value.trim().isEmpty) {
+            continue;
+          }
+          if (cookie.maxAge != null && cookie.maxAge! <= 0) continue;
+          if (cookie.expires != null && !cookie.expires!.isAfter(now)) {
+            continue;
+          }
+          if (cookie.domain == null || cookie.domain!.trim().isEmpty) {
+            cookie.domain = 'zjuam.zju.edu.cn';
+          }
+          if (cookie.path == null || cookie.path!.trim().isEmpty) {
+            cookie.path = '/';
+          }
+          sessionCookies.add(cookie);
         }
-        if (iPlanet.path == null || iPlanet.path!.trim().isEmpty) {
-          iPlanet.path = '/';
-        }
-        return (iPlanet,
-            (location != null && location.contains('ticket='))
-                ? casUri.resolve(location)
-                : service);
+        return (
+          sessionCookies,
+          (location != null && location.contains('ticket='))
+              ? casUri.resolve(location)
+              : service,
+        );
       }
       throw AuthenticationExpiredException(
         '$context：统一认证未签发会话',
