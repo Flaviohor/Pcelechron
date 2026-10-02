@@ -188,6 +188,166 @@ class ZjuAm {
         {'service': service.toString()},
       );
 
+  /// 一次性「带 service 的完整密码登录」（浏览器同款），返回
+  /// `(iPlanetDirectoryPro 会话 Cookie, 带票回调 URI)`。
+  ///
+  /// 为什么不复用 iPlanet 换票：2026-10 起统一认证向 Keycloak（Wisdomgarden
+  /// SSO）迁移，携 iPlanet GET /cas/login?service=... 不再稳定签发票据
+  /// （zdbk 实测 302 到 id.zju.edu.cn 的 Keycloak logout；tgmedia 无票），
+  /// 而带 service 的登录 POST 实测通过 service 白名单（垃圾凭据返回密码
+  /// 错误表单，而非「未认证授权服务」页）。CAS 校验凭据后 302，Location
+  /// 直接携带 `service?ticket=ST-xxx`。
+  static Future<(Cookie?, Uri)> loginForServiceCallback(
+    HttpClient httpClient,
+    String username,
+    String password,
+    Uri service, {
+    String context = '统一认证服务登录',
+  }) async {
+    late HttpClientRequest request;
+    late HttpClientResponse response;
+    final casUri = Uri.https(
+        'zjuam.zju.edu.cn', '/cas/login', {'service': service.toString()});
+
+    try {
+      // execution 与初始 Cookie/JSESSIONID 属于同一次 CAS 表单会话，必须
+      // 先取带 service 的登录页。
+      request = await httpClient
+          .getUrl(casUri)
+          .timeout(const Duration(seconds: 8),
+              onTimeout: () => throw requestTimeout());
+      request.followRedirects = false;
+      response = await request.close().timeout(const Duration(seconds: 8),
+          onTimeout: () => throw requestTimeout());
+      var cookies = List<Cookie>.from(response.cookies);
+      var body = await readResponseBody(response, context: '$context 登录页');
+      if (response.statusCode != HttpStatus.ok) {
+        throw LoginException(
+            '$context：登录页请求失败；HTTP ${response.statusCode}'
+            '；响应摘要：${responseSummary(body)}');
+      }
+      var execution =
+          RegExp(r'name="execution" value="(.*?)"').firstMatch(body)?.group(1);
+      if (execution == null) {
+        // 无表单：典型为 service 被白名单当场拒绝（「未认证授权服务」页）。
+        throw LoginException(
+            '$context：登录页无法获取 execution；HTTP ${response.statusCode}'
+            '；响应摘要：${responseSummary(body)}');
+      }
+
+      // 公钥请求沿用登录页 Cookie，随后才可加密密码并提交 execution。
+      request = await httpClient
+          .getUrl(Uri.parse('https://zjuam.zju.edu.cn/cas/v2/getPubKey'))
+          .timeout(const Duration(seconds: 8),
+              onTimeout: () => throw requestTimeout());
+      request.followRedirects = false;
+      request.cookies.addAll(cookies);
+      response = await request.close().timeout(const Duration(seconds: 8),
+          onTimeout: () => throw requestTimeout());
+      cookies.addAll(response.cookies);
+      body = await readResponseText(
+        response,
+        context: '$context RSA 公钥',
+        expectJson: true,
+        requestUri: Uri.parse('https://zjuam.zju.edu.cn/cas/v2/getPubKey'),
+      );
+      final publicKey = decodeJsonMap(body,
+          context: '$context RSA 公钥；HTTP ${response.statusCode}');
+      var modulusStr = asString(publicKey['modulus']);
+      var exponentStr = asString(publicKey['exponent']);
+      if (modulusStr == null || exponentStr == null) {
+        throw LoginException('$context：RSA 公钥字段缺失；响应摘要：${responseSummary(body)}');
+      }
+
+      late String pwdEnc;
+      try {
+        var modInt = BigInt.parse(modulusStr, radix: 16);
+        var expInt = BigInt.parse(exponentStr, radix: 16);
+        var pwdInt = BigInt.parse(
+            utf8.encode(password).map((e) => e.toRadixString(16)).join(),
+            radix: 16);
+        var pwdEncInt = pwdInt.modPow(expInt, modInt);
+        pwdEnc = pwdEncInt.toRadixString(16).padLeft(128, '0');
+      } on Object catch (error, stackTrace) {
+        if (error is Error) {
+          Error.throwWithStackTrace(error, stackTrace);
+        }
+        throw LoginException("密码不合法");
+      }
+
+      // 携 service 提交：CAS 校验通过即 302，Location 为 带票回调。
+      request = await httpClient
+          .postUrl(casUri)
+          .timeout(const Duration(seconds: 8),
+              onTimeout: () => throw requestTimeout());
+      request.followRedirects = false;
+      request.headers.contentType =
+          ContentType('application', 'x-www-form-urlencoded', charset: 'utf-8');
+      request.cookies.addAll(cookies);
+      request.add(utf8.encode(Uri(queryParameters: {
+        'username': username,
+        'password': pwdEnc,
+        'execution': execution,
+        '_eventId': 'submit',
+        'rememberMe': 'true',
+      }).query));
+      response = await request.close().timeout(const Duration(seconds: 8),
+          onTimeout: () => throw requestTimeout());
+      body = await readResponseBody(response, context: '$context 登录提交');
+
+      final now = DateTime.now();
+      Cookie? iPlanet;
+      for (final cookie in response.cookies) {
+        if (cookie.name == 'iPlanetDirectoryPro' &&
+            cookie.value.isNotEmpty &&
+            (cookie.maxAge == null || cookie.maxAge! > 0) &&
+            (cookie.expires == null || cookie.expires!.isAfter(now))) {
+          // 取最后一个未过期值，避免前面的删除 Cookie 被误用。
+          iPlanet = cookie;
+        }
+      }
+      final location = response.headers.value(HttpHeaders.locationHeader);
+      DiagnosticLogService.instance.record(
+        module: context,
+        operation: 'serviceLoginPost',
+        requestUri: casUri,
+        statusCode: response.statusCode,
+        contentType: response.headers.value(HttpHeaders.contentTypeHeader),
+        location: location,
+        message: iPlanet == null
+            ? '登录响应未下发 iPlanet'
+            : '登录响应已下发 iPlanet',
+      );
+
+      if (response.isRedirect &&
+          location != null &&
+          location.contains('ticket=')) {
+        if (iPlanet != null) {
+          if (iPlanet.domain == null || iPlanet.domain!.trim().isEmpty) {
+            iPlanet.domain = 'zju.edu.cn';
+          }
+          if (iPlanet.path == null || iPlanet.path!.trim().isEmpty) {
+            iPlanet.path = '/';
+          }
+        }
+        return (iPlanet, casUri.resolve(location));
+      }
+      throw AuthenticationExpiredException(
+        '$context：CAS 未签发服务票据',
+        details: 'HTTP ${response.statusCode}\n'
+            'Location：${location ?? '<缺失>'}\n'
+            '响应摘要：${responseSummary(body)}',
+      );
+    } on Object catch (error, stackTrace) {
+      throw exceptionFrom(
+        error,
+        context: context,
+        requestUri: casUri,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
   static bool _isValidServiceCallback(Uri callback, Uri service) {
     final ticket = callback.queryParameters['ticket'];
     return callback.scheme == service.scheme &&

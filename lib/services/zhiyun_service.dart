@@ -12,16 +12,19 @@ import 'package:get/get.dart';
 /// 智云课堂（Zhiyun, classroom.zju.edu.cn）服务——按《智云课堂功能开发
 /// 实现全景技术报告》实现。
 ///
-/// ## 鉴权：zjuam CAS 静默换票 → tgmedia 回调 → 智云 _token（报告·二.1 变体）
+/// ## 鉴权：带 service 的一次性统一认证登录 → tgmedia 回调 → 智云 _token
 ///
-/// zjuam CAS 的 service 白名单实测**不含** classroom.zju.edu.cn（直接返回
-/// 「未认证授权服务」no_auth 页），只认 tgmedia.cmc.zju.edu.cn；而
-/// tgmedia 自己的认证入口（index.php?r=auth/login）会把无会话请求踢去
-/// identity Keycloak 交互登录，无法静默复刻。因此静默链路为：
+/// zjuam CAS 的 service 白名单实测**不含** classroom.zju.edu.cn（no_auth
+/// 页），认 tgmedia.cmc.zju.edu.cn。而「携 iPlanet 复用换票」的老路已被
+/// 向 Keycloak（Wisdomgarden SSO）迁移中的 CAS 废弃——1.3.5.11 实测 CAS
+/// 未按 iPlanet 为 tgmedia 签发票据（zdbk 同样中招，302 甩到
+/// id.zju.edu.cn 的 Keycloak logout）。因此采用浏览器同款的一次性登录：
 ///
-/// 1. 统一认证持有根会话 Cookie `iPlanetDirectoryPro`（ZjuAm.getSsoCookie）；
-/// 2. 携带它请求 `zjuam/cas/login?service=<tgmedia 认证入口>`，CAS 校验
-///    iPlanet 后 302 带票跳回 tgmedia；
+/// 1. `zjuam/cas/login?service=<tgmedia 认证入口>` 取登录表单（execution
+///    与 JSESSIONID 绑定）；
+/// 2. RSA 公钥加密密码后携 service 提交，CAS 校验通过即 302，Location
+///    直接携带 `ticket=ST-xxx` 的 tgmedia 回调（service 白名单实测通过：
+///    垃圾凭据返回密码错误表单而非「未认证授权服务」页）；
 /// 3. tgmedia 校验票据后 forward 到 classroom，会话落成 `_token` cookie；
 /// 4. 之后所有智云 API 携带 `Authorization: Bearer <token>`。
 ///
@@ -59,7 +62,6 @@ class ZhiyunService {
   static const _ssoEntryUrl =
       'https://tgmedia.cmc.zju.edu.cn/index.php?r=auth/login&auType=cmc'
       '&tenant_code=112&forward=https%3A%2F%2Fclassroom.zju.edu.cn%2F';
-  static const _casLoginUrl = 'https://zjuam.zju.edu.cn/cas/login';
   static const _maxRedirectHops = 24;
   static const _zhiyunBase = 'https://classroom.zju.edu.cn';
   static const _userInfoUrl = '$_zhiyunBase/api/v1/user/info';
@@ -111,39 +113,22 @@ class ZhiyunService {
     return token;
   }
 
-  /// CAS SSO 静默换票：iPlanet → zjuam CAS 带票 302 → tgmedia 回调 →
-  /// classroom `_token` cookie。CAS 返回 200 登录页（iPlanet 失效）时，
-  /// 清统一认证缓存重登一次再试。
+  /// CAS 静默换票：带 service 的一次性完整登录（浏览器同款）→ 302 带票 →
+  /// tgmedia 回调 → classroom `_token` cookie。
+  ///
+  /// 携 iPlanet 复用换票的老路已被向 Keycloak 迁移中的 CAS 废弃
+  /// （1.3.5.11 实测「CAS 未签发智云票据」），因此直接用账号密码走带
+  /// service 的登录 POST，票据取自登录响应的 302 Location。
   static Future<String> _loginZhiyunCas(
       String username, String password) async {
-    var iPlanet = await ZjuAm.getSsoCookie(_client, username, password);
-    if (iPlanet == null) {
-      throw const ZhiyunException('统一认证未登录');
-    }
+    final (iPlanet, ticketCallback) = await _loginForZhiyunTicket(
+        username, password);
+
     final jar = ZhiyunCookieJar();
-    // iPlanet 挂父域：SSO 链会经过 zjuam/通行证(zuinfo) 等浙大系主机，
-    // 统一挂到 zju.edu.cn 让全链都能带上凭据。
-    jar.set('zju.edu.cn', iPlanet.name, iPlanet.value);
-
-    // 起点改为 zjuam CAS 静默换票（service=tgmedia 认证入口），不再从
-    // tgmedia 入口起跳——那会撞 identity Keycloak 的交互登录。
-    final casUri = Uri.parse(_casLoginUrl).replace(queryParameters: {
-      'service': Uri.parse(_ssoEntryUrl).toString(),
-    });
-
-    var ticketCallback = await _requestTicketCallback(casUri, jar);
-    if (ticketCallback == null) {
-      // iPlanet 已失效：作废统一认证缓存 cookie，强制重新登录一次。
-      await ZjuAm.clearCachedSsoCookie(username);
-      iPlanet = await ZjuAm.getSsoCookie(_client, username, password);
-      if (iPlanet == null) {
-        throw const ZhiyunException('统一认证重登失败');
-      }
+    if (iPlanet != null) {
+      // iPlanet 挂父域：SSO 链会经过 zjuam/通行证(zuinfo) 等浙大系主机，
+      // 统一挂到 zju.edu.cn 让全链都能带上凭据。
       jar.set('zju.edu.cn', iPlanet.name, iPlanet.value);
-      ticketCallback = await _requestTicketCallback(casUri, jar);
-      if (ticketCallback == null) {
-        throw const ZhiyunException('统一认证会话无效（CAS 未签发智云票据）');
-      }
     }
 
     var currentUrl = ticketCallback;
@@ -214,38 +199,23 @@ class ZhiyunService {
     return token;
   }
 
-  /// 携 iPlanet 请求 zjuam CAS 换票：302 且 Location 带 ticket 时返回
-  /// 解析后的回调 URI；其余（200 登录页等）返回 null，由调用方决定重登。
-  /// 响应 cookie 一并归档进 jar。
-  static Future<Uri?> _requestTicketCallback(
-      Uri casUri, ZhiyunCookieJar jar) async {
-    final request = await _client.openUrl('GET', casUri).timeout(
-          const Duration(seconds: 10),
-          onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
-        );
-    request.followRedirects = false;
-    request.headers.set('User-Agent', _userAgent);
-    for (final cookie in jar.cookiesFor(casUri)) {
-      request.cookies.add(cookie);
+  /// 一次性带 service 的统一认证登录；把 ZjuAm 的异常翻译成卡片可展示的
+  /// 单行短句（细节已由诊断日志记录）。
+  static Future<(Cookie?, Uri)> _loginForZhiyunTicket(
+      String username, String password) async {
+    try {
+      return await ZjuAm.loginForServiceCallback(
+        _client,
+        username,
+        password,
+        Uri.parse(_ssoEntryUrl),
+        context: '智云课堂统一认证',
+      );
+    } on Exception catch (error) {
+      final message = error.toString().split('\n').first.trim();
+      throw ZhiyunException(
+          message.isEmpty ? '统一认证登录失败' : '统一认证登录失败（$message）');
     }
-    final response = await request.close().timeout(
-          const Duration(seconds: 10),
-          onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
-        );
-    for (final raw
-        in response.headers[HttpHeaders.setCookieHeader] ?? <String>[]) {
-      jar.store(casUri, raw);
-    }
-    final location = response.headers.value(HttpHeaders.locationHeader);
-    await response.drain<void>();
-    final status = response.statusCode;
-    if ((status == HttpStatus.movedTemporarily ||
-            status == HttpStatus.seeOther) &&
-        location != null &&
-        location.contains('ticket=')) {
-      return _resolveRedirect(casUri, location);
-    }
-    return null;
   }
 
   /// 从重定向响应里解析下一跳：Location 头 → Refresh 头 → HTML/JS 内联。
