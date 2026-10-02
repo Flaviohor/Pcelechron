@@ -321,30 +321,31 @@ class ZjuAm {
         location: location,
         message: iPlanet == null
             ? '登录响应未下发 iPlanet'
-            : '登录响应已下发 iPlanet',
+            : '登录响应已下发 iPlanet；Location 长度 '
+                '${location?.length ?? 0}，含票据=${location?.contains('ticket=') ?? false}',
       );
 
-      if (response.isRedirect && location != null && iPlanet != null) {
-        final callback = casUri.resolve(location);
-        // 两种成功形态：
-        // a) Location 带 ticket=（标准 CAS 票据回调）；
-        // b) 无票但已签发 iPlanet 且跳回 service 主机——tgmedia 这类挂
-        //    OpenAM Agent 的应用认 iPlanetDirectoryPro Cookie，CAS 登录
-        //    成功后直接 302 回应用（1.3.5.12 实测 Location 无 ticket），
-        //    此时从 service 入口本身起链，凭 iPlanet 走完后续跳转。
-        if (location.contains('ticket=') || callback.host == service.host) {
-          if (iPlanet.domain == null || iPlanet.domain!.trim().isEmpty) {
-            iPlanet.domain = 'zju.edu.cn';
-          }
-          if (iPlanet.path == null || iPlanet.path!.trim().isEmpty) {
-            iPlanet.path = '/';
-          }
-          return (iPlanet,
-              location.contains('ticket=') ? callback : service);
+      if (iPlanet != null) {
+        // 登录成功——重构后唯一判据：CAS 校验凭据并签发 iPlanet 即算登录，
+        // 不再猜测 302 Location 的形态（1.3.5.13 曾因宿主比对误判失败）。
+        // 跳转目标：
+        // - Location 带 ticket=：标准 CAS 票据回调，原样起链；
+        // - 其余一律从 service 入口起链——tgmedia 挂 OpenAM Agent，认
+        //   iPlanetDirectoryPro 而非票据（1.3.5.12 实测其 302 无票），
+        //   携新 iPlanet 重访入口即可被 Agent 接收。
+        if (iPlanet.domain == null || iPlanet.domain!.trim().isEmpty) {
+          iPlanet.domain = 'zju.edu.cn';
         }
+        if (iPlanet.path == null || iPlanet.path!.trim().isEmpty) {
+          iPlanet.path = '/';
+        }
+        return (iPlanet,
+            (location != null && location.contains('ticket='))
+                ? casUri.resolve(location)
+                : service);
       }
       throw AuthenticationExpiredException(
-        '$context：CAS 未签发服务票据',
+        '$context：统一认证未签发会话',
         details: 'HTTP ${response.statusCode}\n'
             'Location：${location ?? '<缺失>'}\n'
             '响应摘要：${responseSummary(body)}',

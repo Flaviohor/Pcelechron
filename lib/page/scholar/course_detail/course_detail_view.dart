@@ -665,105 +665,119 @@ class _ClassroomSectionState extends State<_ClassroomSection> {
       duration: const Duration(milliseconds: 250),
       curve: Curves.easeOutCubic,
       alignment: Alignment.topCenter,
-      child: switch (_phase) {
-        _ZhiyunPhase.hidden => const SizedBox(width: double.infinity),
-        _ZhiyunPhase.checking => _wrapCard(
-            context,
-            title: '正在检查智云课堂的回放…',
-            detail: '登录智云课堂并匹配本课（需校园网）',
-            trailing: const CupertinoActivityIndicator(radius: 9),
-          ),
-        _ZhiyunPhase.ready => RoundRectangleCard(
-            onTap: _opening ? null : _open,
-            child: Padding(
-              padding: const EdgeInsets.only(left: 8, right: 8),
-              child: Row(
-                children: [
-                  const Icon(CupertinoIcons.play_circle,
-                      size: 26, color: CupertinoColors.activeBlue),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('智云课堂 · ${widget.course.name}',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: CupertinoTheme.of(context)
-                                .textTheme
-                                .textStyle
-                                .copyWith(
-                                    fontSize: 15, fontWeight: FontWeight.w600)),
-                        Text(
-                          _readySubtitle,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: CupertinoDynamicColor.resolve(
-                                CupertinoColors.secondaryLabel, context),
-                          ),
+      child: _phase == _ZhiyunPhase.hidden
+          // 与本课任务一致：无内容时连小标题一起整段隐藏。
+          ? const SizedBox(width: double.infinity)
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SubSubtitleRow(subtitle: '智云课堂'),
+                switch (_phase) {
+                  _ZhiyunPhase.hidden => const SizedBox(width: double.infinity),
+                  _ZhiyunPhase.checking => _wrapCard(
+                      context,
+                      title: '正在检查智云课堂的回放…',
+                      detail: '登录智云课堂并匹配本课（需校园网）',
+                      trailing: const CupertinoActivityIndicator(radius: 9),
+                    ),
+                  _ZhiyunPhase.ready => RoundRectangleCard(
+                      onTap: _opening ? null : _open,
+                      child: Padding(
+                        padding: const EdgeInsets.only(left: 8, right: 8),
+                        child: Row(
+                          children: [
+                            const Icon(CupertinoIcons.play_circle,
+                                size: 26, color: CupertinoColors.activeBlue),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text('智云课堂 · ${widget.course.name}',
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: CupertinoTheme.of(context)
+                                          .textTheme
+                                          .textStyle
+                                          .copyWith(
+                                              fontSize: 15,
+                                              fontWeight: FontWeight.w600)),
+                                  Text(
+                                    _readySubtitle,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: CupertinoDynamicColor.resolve(
+                                          CupertinoColors.secondaryLabel,
+                                          context),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            if (_opening)
+                              const CupertinoActivityIndicator(radius: 9)
+                            else
+                              Icon(CupertinoIcons.chevron_right,
+                                  size: 14,
+                                  color: CupertinoDynamicColor.resolve(
+                                      CupertinoColors.tertiaryLabel, context)),
+                          ],
                         ),
-                      ],
+                      ),
                     ),
-                  ),
-                  if (_opening)
-                    const CupertinoActivityIndicator(radius: 9)
-                  else
-                    Icon(CupertinoIcons.chevron_right,
-                        size: 14,
-                        color: CupertinoDynamicColor.resolve(
-                            CupertinoColors.tertiaryLabel, context)),
-                ],
-              ),
-            ),
-          ),
-        _ZhiyunPhase.error => RoundRectangleCard(
-            onTap: () => _openOfficial(),
-            child: Padding(
-              padding: const EdgeInsets.only(left: 8, right: 8),
-              child: Row(
-                children: [
-                  Icon(CupertinoIcons.exclamationmark_circle,
-                      size: 26,
-                      color: CupertinoDynamicColor.resolve(
-                          CupertinoColors.systemOrange, context)),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('智云课堂暂不可用',
-                            style: CupertinoTheme.of(context)
-                                .textTheme
-                                .textStyle
-                                .copyWith(
-                                    fontSize: 15, fontWeight: FontWeight.w600)),
-                        Text(_detail,
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: CupertinoDynamicColor.resolve(
-                                  CupertinoColors.secondaryLabel, context),
-                            )),
-                      ],
+                  _ZhiyunPhase.error => RoundRectangleCard(
+                      onTap: () => _openOfficial(),
+                      child: Padding(
+                        padding: const EdgeInsets.only(left: 8, right: 8),
+                        child: Row(
+                          children: [
+                            Icon(CupertinoIcons.exclamationmark_circle,
+                                size: 26,
+                                color: CupertinoDynamicColor.resolve(
+                                    CupertinoColors.systemOrange, context)),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text('智云课堂暂不可用',
+                                      style: CupertinoTheme.of(context)
+                                          .textTheme
+                                          .textStyle
+                                          .copyWith(
+                                              fontSize: 15,
+                                              fontWeight: FontWeight.w600)),
+                                  Text(_detail,
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color: CupertinoDynamicColor.resolve(
+                                            CupertinoColors.secondaryLabel,
+                                            context),
+                                      )),
+                                ],
+                              ),
+                            ),
+                            CupertinoButton(
+                              padding: EdgeInsets.zero,
+                              onPressed: _resolve,
+                              child: Text('重试',
+                                  style: TextStyle(
+                                      fontSize: 14,
+                                      color: CupertinoDynamicColor.resolve(
+                                          CupertinoColors.activeBlue,
+                                          context))),
+                            ),
+                          ],
+                        ),
+                      ),
                     ),
-                  ),
-                  CupertinoButton(
-                    padding: EdgeInsets.zero,
-                    onPressed: _resolve,
-                    child: Text('重试',
-                        style: TextStyle(
-                            fontSize: 14,
-                            color: CupertinoDynamicColor.resolve(
-                                CupertinoColors.activeBlue, context))),
-                  ),
-                ],
-              ),
+                },
+              ],
             ),
-          ),
-      },
     );
   }
 
