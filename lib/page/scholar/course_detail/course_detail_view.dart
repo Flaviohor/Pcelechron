@@ -603,12 +603,24 @@ class _ClassroomSectionState extends State<_ClassroomSection> {
       _finish(_ZhiyunPhase.error, '未登录，登录后即可关联智云课堂回放');
       return;
     }
-    final result = await ZhiyunService.resolveCourse(
-      courseName: widget.course.name,
-      teacher: widget.course.teacher,
-      username: scholar.username,
-      password: scholar.password,
-    );
+    ZhiyunResolve result;
+    try {
+      result = await ZhiyunService.resolveCourse(
+        courseName: widget.course.name,
+        teacher: widget.course.teacher,
+        username: scholar.username,
+        password: scholar.password,
+      );
+    } on ZhiyunException catch (error) {
+      // 任何未预期异常都不允许把卡片留在 checking 态（永远转圈）。
+      _finish(_ZhiyunPhase.error, error.message);
+      return;
+    } on Exception catch (error) {
+      final message = error.toString().split('\n').first.trim();
+      _finish(_ZhiyunPhase.error,
+          message.isEmpty ? '智云课堂解析失败' : '智云课堂解析失败（$message）');
+      return;
+    }
     if (!mounted) return;
     switch (result.kind) {
       case ZhiyunResolveKind.ready:

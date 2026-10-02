@@ -135,7 +135,13 @@ class ZhiyunService {
     var currentUrl = ticketCallback;
     var reachedClassroom = false;
     var lastBody = '';
+    // 链路总时限：逐跳超时管得住单跳，管不住「跳得慢」的重定向环。
+    final chainStopwatch = Stopwatch()..start();
     for (var hop = 0; hop < _maxRedirectHops; hop++) {
+      if (chainStopwatch.elapsed > const Duration(seconds: 45)) {
+        throw ZhiyunException(
+            '智云课堂登录链路超时（已 $hop 跳，停留在 ${currentUrl.host}）');
+      }
       final request = await _client.openUrl('GET', currentUrl).timeout(
             const Duration(seconds: 10),
             onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
@@ -149,11 +155,20 @@ class ZhiyunService {
             const Duration(seconds: 10),
             onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
           );
+      // 逐跳留痕：重定向环 / 卡点域名可直接从诊断日志读出。
+      DiagnosticLogService.instance.record(
+        module: 'zhiyun',
+        operation: 'ssoHop',
+        requestUri: currentUrl,
+        statusCode: response.statusCode,
+        location: response.headers.value(HttpHeaders.locationHeader),
+        message: 'SSO 第${hop + 1}跳',
+      );
       for (final raw
           in response.headers[HttpHeaders.setCookieHeader] ?? <String>[]) {
         jar.store(currentUrl, raw);
       }
-      final body = await response.transform(utf8.decoder).join();
+      final body = await _readBodyWithTimeout(response);
 
       final target = _nextRedirectTarget(currentUrl, response, body);
       if (target != null) {
@@ -191,7 +206,11 @@ class ZhiyunService {
           const Duration(seconds: 10),
           onTimeout: () => throw const ZhiyunException('智云课堂请求超时'),
         );
-    await warmUpResponse.drain<void>();
+    // 预热体的读取同样限时：超时就跳过（_token 已在 jar 里，不阻塞登录）。
+    await warmUpResponse.drain<void>().timeout(
+          const Duration(seconds: 10),
+          onTimeout: () {},
+        );
 
     final token = jar.tokenFor('classroom.zju.edu.cn');
     if (token == null || token.isEmpty) {
@@ -282,6 +301,15 @@ class ZhiyunService {
 
   // ===== 基础请求：401 自愈 + 统一解析 =====
 
+  /// 限时读取响应体：`close()` 的超时管不到读流，钉扎入口/隧道若把
+  /// body 拖住不结束，无界 join() 会让卡片永远转圈。
+  static Future<String> _readBodyWithTimeout(HttpClientResponse response) {
+    return response.transform(utf8.decoder).join().timeout(
+          const Duration(seconds: 10),
+          onTimeout: () => throw const ZhiyunException('智云课堂响应读取超时'),
+        );
+  }
+
   /// GET 一个智云 API 并解析 JSON；401 时重登并重放一次。
   static Future<Map<String, dynamic>> _getJson(
       Uri uri, String token, void Function(String) setToken) async {
@@ -296,7 +324,7 @@ class ZhiyunService {
             const Duration(seconds: 10),
             onTimeout: () => throw const ZhiyunException('智云课堂请求超时'),
           );
-      final body = await response.transform(utf8.decoder).join();
+      final body = await _readBodyWithTimeout(response);
       if (response.statusCode == HttpStatus.unauthorized && attempt == 0) {
         // token 失效：自愈后重放。
         _reloginZhiyun();
@@ -572,7 +600,7 @@ class ZhiyunService {
           const Duration(seconds: 10),
           onTimeout: () => throw const ZhiyunException('智云课堂搜索超时'),
         );
-    final body = await response.transform(utf8.decoder).join();
+    final body = await _readBodyWithTimeout(response);
     final payload = decodeJsonMap(body, context: '智云课堂搜索');
     final courses = <ZhiyunCourse>[];
     for (final raw in _iterableOf(payload['list'] ?? payload['courses'])) {
