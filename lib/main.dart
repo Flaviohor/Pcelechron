@@ -18,6 +18,7 @@ import 'package:celechron/worker/ecard_widget_messenger.dart';
 import 'package:celechron/database/database_helper.dart';
 import 'package:celechron/database/hive_paths.dart';
 import 'package:celechron/design/glass.dart';
+import 'package:celechron/http/zju_ingress_fallback.dart';
 import 'package:celechron/services/app_update_service.dart';
 import 'package:celechron/services/desktop_tray_service.dart';
 import 'package:celechron/utils/global.dart';
@@ -61,6 +62,9 @@ CupertinoThemeData buildAppCupertinoTheme(BrightnessMode mode) {
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // 挂载「共享 ingress 钉扎」网络绕行（见 ZjuIngressFallback）：必须早于
+  // 任何 HttpClient 构造；只影响钉扎清单里的浙大主机，其余流量行为不变。
+  HttpOverrides.global = ZjuIngressFallback();
   ECardWidgetMessenger.installNativeHandler();
 
   // 应用显示版本（关于页 / 更新检查比对用）：从平台版本资源读取，
