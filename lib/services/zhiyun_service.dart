@@ -12,7 +12,7 @@ import 'package:get/get.dart';
 /// 智云课堂（Zhiyun, classroom.zju.edu.cn）服务——按《智云课堂功能开发
 /// 实现全景技术报告》实现。
 ///
-/// ## 鉴权：带 service 的一次性统一认证登录 → tgmedia 回调 → 智云 _token
+/// ## 鉴权：带 service 的一次性统一认证登录 → tgmedia 会话 → 智云 _token
 ///
 /// zjuam CAS 的 service 白名单实测**不含** classroom.zju.edu.cn（no_auth
 /// 页），认 tgmedia.cmc.zju.edu.cn。而「携 iPlanet 复用换票」的老路已被
@@ -22,10 +22,11 @@ import 'package:get/get.dart';
 ///
 /// 1. `zjuam/cas/login?service=<tgmedia 认证入口>` 取登录表单（execution
 ///    与 JSESSIONID 绑定）；
-/// 2. RSA 公钥加密密码后携 service 提交，CAS 校验通过即 302，Location
-///    直接携带 `ticket=ST-xxx` 的 tgmedia 回调（service 白名单实测通过：
-///    垃圾凭据返回密码错误表单而非「未认证授权服务」页）；
-/// 3. tgmedia 校验票据后 forward 到 classroom，会话落成 `_token` cookie；
+/// 2. RSA 公钥加密密码后携 service 提交，CAS 校验通过即 302 跳回
+///    tgmedia 并下发新 iPlanet（1.3.5.12 实测：Location 不带 ticket——
+///    tgmedia 挂 OpenAM Agent，认 iPlanetDirectoryPro 而非 CAS 票据）；
+/// 3. 凭新 iPlanet 从 tgmedia 入口起跳：Agent 校验通过后 forward 到
+///    classroom，会话落成 `_token` cookie；
 /// 4. 之后所有智云 API 携带 `Authorization: Bearer <token>`。
 ///
 /// 网络层：校外部分线路到 classroom/tgmedia 等真实 IP 被黑洞，

@@ -189,14 +189,19 @@ class ZjuAm {
       );
 
   /// 一次性「带 service 的完整密码登录」（浏览器同款），返回
-  /// `(iPlanetDirectoryPro 会话 Cookie, 带票回调 URI)`。
+  /// `(iPlanetDirectoryPro 会话 Cookie, 起链回调 URI)`。
   ///
   /// 为什么不复用 iPlanet 换票：2026-10 起统一认证向 Keycloak（Wisdomgarden
   /// SSO）迁移，携 iPlanet GET /cas/login?service=... 不再稳定签发票据
   /// （zdbk 实测 302 到 id.zju.edu.cn 的 Keycloak logout；tgmedia 无票），
   /// 而带 service 的登录 POST 实测通过 service 白名单（垃圾凭据返回密码
-  /// 错误表单，而非「未认证授权服务」页）。CAS 校验凭据后 302，Location
-  /// 直接携带 `service?ticket=ST-xxx`。
+  /// 错误表单，而非「未认证授权服务」页）。
+  ///
+  /// 登录成功的两种 302 形态（1.3.5.12 实测后者）：
+  /// a) Location 带 `ticket=`：标准 CAS 票据回调，原样返回；
+  /// b) 无票跳回 service 主机：tgmedia 这类挂 OpenAM Agent 的应用认
+  ///    iPlanetDirectoryPro，登录成功即 302 回应用，此时返回 service 入口
+  ///    本身，由调用方凭 iPlanet 走完后续跳转链。
   static Future<(Cookie?, Uri)> loginForServiceCallback(
     HttpClient httpClient,
     String username,
@@ -319,18 +324,24 @@ class ZjuAm {
             : '登录响应已下发 iPlanet',
       );
 
-      if (response.isRedirect &&
-          location != null &&
-          location.contains('ticket=')) {
-        if (iPlanet != null) {
+      if (response.isRedirect && location != null && iPlanet != null) {
+        final callback = casUri.resolve(location);
+        // 两种成功形态：
+        // a) Location 带 ticket=（标准 CAS 票据回调）；
+        // b) 无票但已签发 iPlanet 且跳回 service 主机——tgmedia 这类挂
+        //    OpenAM Agent 的应用认 iPlanetDirectoryPro Cookie，CAS 登录
+        //    成功后直接 302 回应用（1.3.5.12 实测 Location 无 ticket），
+        //    此时从 service 入口本身起链，凭 iPlanet 走完后续跳转。
+        if (location.contains('ticket=') || callback.host == service.host) {
           if (iPlanet.domain == null || iPlanet.domain!.trim().isEmpty) {
             iPlanet.domain = 'zju.edu.cn';
           }
           if (iPlanet.path == null || iPlanet.path!.trim().isEmpty) {
             iPlanet.path = '/';
           }
+          return (iPlanet,
+              location.contains('ticket=') ? callback : service);
         }
-        return (iPlanet, casUri.resolve(location));
       }
       throw AuthenticationExpiredException(
         '$context：CAS 未签发服务票据',
