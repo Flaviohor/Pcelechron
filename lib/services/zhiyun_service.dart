@@ -130,17 +130,7 @@ class ZhiyunService {
         await _loginForZhiyunTicket(username, password);
 
     final jar = ZhiyunCookieJar();
-    for (final cookie in sessionCookies) {
-      if (cookie.name == 'iPlanetDirectoryPro') {
-        // iPlanet 挂父域：tgmedia 等挂 OpenAM Agent 的主机靠它建会话。
-        jar.set('zju.edu.cn', cookie.name, cookie.value);
-      } else {
-        // 其余（CASTGC 等 CAS 会话）按签发域归档：authorize 静默放行
-        // 需要，但不外泄给链路上的其它浙大主机。
-        jar.set(cookie.domain ?? 'zjuam.zju.edu.cn', cookie.name,
-            cookie.value);
-      }
-    }
+    _seedSessionCookies(jar, sessionCookies);
     // Cookie 名单（仅名字，不含值）：authorize 是否放行可直接对账。
     DiagnosticLogService.instance.record(
       module: 'zhiyun',
@@ -152,6 +142,7 @@ class ZhiyunService {
     var currentUrl = chainStart;
     var reachedClassroom = false;
     var lastBody = '';
+    var reauthCount = 0;
     // 链路总时限：逐跳超时管得住单跳，管不住「跳得慢」的重定向环。
     final chainStopwatch = Stopwatch()..start();
     for (var hop = 0; hop < _maxRedirectHops; hop++) {
@@ -199,6 +190,44 @@ class ZhiyunService {
         jar.store(currentUrl, raw);
       }
       final body = await _readBodyWithTimeout(response);
+
+      // 卡在 zjuam CAS 登录表单（OAuth authorize 等流程把未持对应会话的
+      // 请求踢到表单，而 CAS 不签发 CASTGC、又不认 iPlanet）：对表单自己的
+      // service 再做一次带 service 的一次性密码提交——等价于浏览器用户
+      // 在这页输入密码，然后从带票回调继续。最多 2 次，防表单环。
+      final serviceParam = currentUrl.queryParameters['service'];
+      if (reauthCount < 2 &&
+          response.statusCode == HttpStatus.ok &&
+          currentUrl.host == 'zjuam.zju.edu.cn' &&
+          currentUrl.path.startsWith('/cas/login') &&
+          serviceParam != null &&
+          serviceParam.isNotEmpty &&
+          body.contains('name="execution"')) {
+        reauthCount++;
+        DiagnosticLogService.instance.record(
+          module: 'zhiyun',
+          operation: 'ssoReauth',
+          requestUri: currentUrl,
+          message: '在 CAS 登录表单重新提交密码（第 $reauthCount 次）',
+        );
+        try {
+          final (reauthCookies, reauthTarget) = await _loginForZhiyunTicket(
+              username, password,
+              service: Uri.parse(serviceParam));
+          _seedSessionCookies(jar, reauthCookies);
+          currentUrl = reauthTarget;
+          continue;
+        } on ZhiyunException catch (error) {
+          // 重认证失败（service 被拒等）：落回正常流程，由 ssoStuck
+          // 带上停留点。
+          DiagnosticLogService.instance.record(
+            module: 'zhiyun',
+            operation: 'ssoReauth',
+            requestUri: currentUrl,
+            error: error,
+          );
+        }
+      }
 
       final target = _nextRedirectTarget(currentUrl, response, body);
       if (target != null) {
@@ -249,21 +278,36 @@ class ZhiyunService {
   }
 
   /// 一次性带 service 的统一认证登录；把 ZjuAm 的异常翻译成卡片可展示的
-  /// 单行短句（细节已由诊断日志记录）。
+  /// 单行短句（细节已由诊断日志记录）。[service] 缺省为 tgmedia 认证入口，
+  /// 链路卡在 CAS 登录表单时用表单自己的 service 重入。
   static Future<(List<Cookie>, Uri)> _loginForZhiyunTicket(
-      String username, String password) async {
+      String username, String password,
+      {Uri? service}) async {
     try {
       return await ZjuAm.loginForServiceCallback(
         _client,
         username,
         password,
-        Uri.parse(_ssoEntryUrl),
+        service ?? Uri.parse(_ssoEntryUrl),
         context: '智云课堂统一认证',
       );
     } on Exception catch (error) {
       final message = error.toString().split('\n').first.trim();
       throw ZhiyunException(
           message.isEmpty ? '统一认证登录失败' : '统一认证登录失败（$message）');
+    }
+  }
+
+  /// 登录会话 Cookie 入罐：iPlanet 挂父域（OpenAM Agent 靠它建会话），
+  /// 其余（JSESSIONID/CASTGC 等）按签发域归档，不外泄给链上其它主机。
+  static void _seedSessionCookies(ZhiyunCookieJar jar, List<Cookie> cookies) {
+    for (final cookie in cookies) {
+      if (cookie.name == 'iPlanetDirectoryPro') {
+        jar.set('zju.edu.cn', cookie.name, cookie.value);
+      } else {
+        jar.set(cookie.domain ?? 'zjuam.zju.edu.cn', cookie.name,
+            cookie.value);
+      }
     }
   }
 

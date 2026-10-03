@@ -325,14 +325,12 @@ class ZjuAm {
                 '${location?.length ?? 0}，含票据=${location?.contains('ticket=') ?? false}',
       );
 
-      if (iPlanet != null) {
-        // 登录成功——判据只看一件事：CAS 校验凭据并签发了 iPlanet，
-        // 不再猜测 302 Location 形态（1.3.5.13 曾因宿主比对误判失败）。
-        //
-        // 会话 Cookie 全量回传（按名去重，登录 POST 响应优先）：CAS 的
-        // SSO 会话可能落在表单阶段的 JSESSIONID / CASTGC 上——1.3.5.16
-        // 只回传 POST 响应 Cookie，oauth2.0/authorize 仍认不出会话，
-        // 被踢回登录表单（ssoHop 日志实测）。
+      final hasTicket = location != null && location.contains('ticket=');
+      if (iPlanet != null || hasTicket) {
+        // 登录成功——判据：CAS 校验凭据并签发了 iPlanet，或 302 带票
+        // （OAuth 流程的表单重提交可能不再重复签发 iPlanet）。
+        // 跳转目标：带票走票据回调；否则从 service 入口起链（tgmedia 的
+        // OpenAM Agent 认 iPlanet，302 无票）。
         final merged = <String, Cookie>{};
         void collect(List<Cookie> list) {
           for (final cookie in list) {
@@ -360,9 +358,7 @@ class ZjuAm {
         }).toList();
         return (
           sessionCookies,
-          (location != null && location.contains('ticket='))
-              ? casUri.resolve(location)
-              : service,
+          hasTicket ? casUri.resolve(location) : service,
         );
       }
       throw AuthenticationExpiredException(
