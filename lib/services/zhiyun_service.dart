@@ -192,85 +192,51 @@ class ZhiyunService {
       final body = await _readBodyWithTimeout(response);
 
       // 卡在 zjuam CAS 登录表单（OAuth authorize 把未持对应会话的请求踢到
-      // 表单；CAS 不签发 CASTGC、authorize 也不认 iPlanet，且待处理 OAuth
-      // 请求就存在本次会话里）——必须就着当前表单、当前会话提交密码（浏览
-      // 器用户同款）：URL 原样（service 参数逐字节不动）、Cookie 沿用罐内
-      // 当前值、execution 取自本页。提交后 302 带票/带 code 回 OAuth 回调，
-      // 链路继续。最多 2 次，防表单环。1.3.5.18 的重认证另起新会话，
-      // callbackAuthorize 找不到 authorize 存的待处理请求而拒票（日志实测）。
+      // 表单；CAS 不签发 CASTGC、authorize 也不认 iPlanet）。处理取两轮
+      // 实测之长：用 1.3.5.18 验证过的「全新流程一次性密码提交」（它能拿
+      // 到票），但 service 用 1.3.5.19 的逐字节原样串——从表单 URL 的
+      // query 里直接截取，不解码不再编码（CAS 的票据校验按 service 串逐
+      // 字节比对，重编码会让票被拒）。OAuth 的待处理请求就在 service 串
+      // 里（client_id/redirect_uri），不依赖会话，全新流程无碍。最多 2 次，
+      // 防表单环。
       if (reauthCount < 2 &&
           response.statusCode == HttpStatus.ok &&
           currentUrl.host == 'zjuam.zju.edu.cn' &&
           currentUrl.path.startsWith('/cas/login') &&
           body.contains('name="execution"')) {
         reauthCount++;
+        String? rawService;
+        for (final pair in currentUrl.query.split('&')) {
+          if (pair.startsWith('service=')) {
+            rawService = pair.substring('service='.length);
+            break;
+          }
+        }
         DiagnosticLogService.instance.record(
           module: 'zhiyun',
           operation: 'ssoReauth',
           requestUri: currentUrl,
-          message: '在 CAS 登录表单原样重新提交密码（第 $reauthCount 次，'
-              '沿用本会话与表单 URL）',
+          message: '在 CAS 登录表单重新提交密码（第 $reauthCount 次，'
+              '原样 service 长度 ${rawService?.length ?? 0}）',
         );
-        try {
-          final execution = RegExp(r'name="execution" value="(.*?)"')
-              .firstMatch(body)
-              ?.group(1);
-          if (execution == null) {
-            throw const ZhiyunException('登录表单缺少 execution');
-          }
-          final pwdEnc = await _encryptZjuamPassword(password);
-          final formRequest = await _client.postUrl(currentUrl).timeout(
-                const Duration(seconds: 10),
-                onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
-              );
-          formRequest.followRedirects = false;
-          formRequest.headers.contentType = ContentType(
-              'application', 'x-www-form-urlencoded', charset: 'utf-8');
-          for (final cookie in jar.cookiesFor(currentUrl)) {
-            formRequest.cookies.add(cookie);
-          }
-          formRequest.add(utf8.encode(Uri(queryParameters: {
-            'username': username,
-            'password': pwdEnc,
-            'execution': execution,
-            '_eventId': 'submit',
-            'rememberMe': 'true',
-          }).query));
-          final formResponse = await formRequest.close().timeout(
-                const Duration(seconds: 10),
-                onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
-              );
-          for (final raw in formResponse.headers[HttpHeaders.setCookieHeader] ??
-              <String>[]) {
-            jar.store(currentUrl, raw);
-          }
-          final formLocation =
-              formResponse.headers.value(HttpHeaders.locationHeader);
-          await formResponse.drain<void>();
-          DiagnosticLogService.instance.record(
-            module: 'zhiyun',
-            operation: 'ssoReauth',
-            requestUri: currentUrl,
-            statusCode: formResponse.statusCode,
-            location: formLocation,
-            message: '表单重提交响应：HTTP ${formResponse.statusCode}；'
-                'Location 长度 ${formLocation?.length ?? 0}，'
-                '含票据=${formLocation?.contains('ticket=') ?? false}',
-          );
-          if (formResponse.statusCode == HttpStatus.movedTemporarily &&
-              formLocation != null &&
-              formLocation.isNotEmpty) {
-            currentUrl = currentUrl.resolve(formLocation);
+        if (rawService != null && rawService.isNotEmpty) {
+          try {
+            final (reauthCookies, reauthTarget) = await _loginForZhiyunTicket(
+                username, password,
+                rawServiceQuery: rawService);
+            _seedSessionCookies(jar, reauthCookies);
+            currentUrl = reauthTarget;
             continue;
+          } on Exception catch (error) {
+            // 重认证失败（service 被拒等）：落回正常流程，由 ssoStuck
+            // 带上停留点。
+            DiagnosticLogService.instance.record(
+              module: 'zhiyun',
+              operation: 'ssoReauth',
+              requestUri: currentUrl,
+              error: error,
+            );
           }
-          // 非 302（表单重出=凭据被拒等）：落回正常流程，由 ssoStuck 带停留点。
-        } on Exception catch (error) {
-          DiagnosticLogService.instance.record(
-            module: 'zhiyun',
-            operation: 'ssoReauth',
-            requestUri: currentUrl,
-            error: error,
-          );
         }
       }
 
@@ -324,18 +290,19 @@ class ZhiyunService {
   }
 
   /// 一次性带 service 的统一认证登录；把 ZjuAm 的异常翻译成卡片可展示的
-  /// 单行短句（细节已由诊断日志记录）。[service] 缺省为 tgmedia 认证入口，
-  /// 链路卡在 CAS 登录表单时用表单自己的 service 重入。
+  /// 单行短句（细节已由诊断日志记录）。[rawServiceQuery] 为已编码的
+  /// service 原始串（表单重认证用，逐字节不动）；缺省走 tgmedia 认证入口。
   static Future<(List<Cookie>, Uri)> _loginForZhiyunTicket(
       String username, String password,
-      {Uri? service}) async {
+      {String? rawServiceQuery}) async {
     try {
       return await ZjuAm.loginForServiceCallback(
         _client,
         username,
         password,
-        service ?? Uri.parse(_ssoEntryUrl),
+        Uri.parse(_ssoEntryUrl),
         context: '智云课堂统一认证',
+        rawServiceQuery: rawServiceQuery,
       );
     } on Exception catch (error) {
       final message = error.toString().split('\n').first.trim();
@@ -447,37 +414,6 @@ class ZhiyunService {
           const Duration(seconds: 10),
           onTimeout: () => throw const ZhiyunException('智云课堂响应读取超时'),
         );
-  }
-
-  /// 取统一认证 RSA 公钥并加密密码（浏览器同款），返回 128 位十六进制
-  /// 密文。公钥接口无会话依赖，表单重认证与带 service 登录共用。
-  static Future<String> _encryptZjuamPassword(String password) async {
-    final request = await _client
-        .getUrl(Uri.parse('https://zjuam.zju.edu.cn/cas/v2/getPubKey'))
-        .timeout(const Duration(seconds: 8),
-            onTimeout: () => throw const ZhiyunException('统一认证请求超时'));
-    request.followRedirects = false;
-    final response = await request.close().timeout(const Duration(seconds: 8),
-        onTimeout: () => throw const ZhiyunException('统一认证请求超时'));
-    final body = await _readBodyWithTimeout(response);
-    final publicKey = decodeJsonMap(
-        body, context: '统一认证 RSA 公钥；HTTP ${response.statusCode}');
-    final modulusStr = asString(publicKey['modulus']);
-    final exponentStr = asString(publicKey['exponent']);
-    if (modulusStr == null || exponentStr == null) {
-      throw ZhiyunException(
-          '统一认证 RSA 公钥字段缺失；响应摘要：${responseSummary(body)}');
-    }
-    try {
-      final modInt = BigInt.parse(modulusStr, radix: 16);
-      final expInt = BigInt.parse(exponentStr, radix: 16);
-      final pwdInt = BigInt.parse(
-          utf8.encode(password).map((e) => e.toRadixString(16)).join(),
-          radix: 16);
-      return pwdInt.modPow(expInt, modInt).toRadixString(16).padLeft(128, '0');
-    } on Object {
-      throw const ZhiyunException('统一认证：密码加密失败');
-    }
   }
 
   /// GET 一个智云 API 并解析 JSON；401 时重登并重放一次。

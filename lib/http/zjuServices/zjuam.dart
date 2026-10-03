@@ -208,11 +208,19 @@ class ZjuAm {
     String password,
     Uri service, {
     String context = '统一认证服务登录',
+    String? rawServiceQuery,
   }) async {
     late HttpClientRequest request;
     late HttpClientResponse response;
-    final casUri = Uri.https(
-        'zjuam.zju.edu.cn', '/cas/login', {'service': service.toString()});
+    // rawServiceQuery 非空时逐字节原样使用（调用方从表单 URL query 截取
+    // 的已编码 service 子串）：CAS 的票据校验按 service 串逐字节比对，
+    // 任何解码/再编码都会让票据被判无效（1.3.5.18 实测 callbackAuthorize
+    // 拒票）。
+    final casUri = rawServiceQuery != null
+        ? Uri.parse(
+            'https://zjuam.zju.edu.cn/cas/login?service=$rawServiceQuery')
+        : Uri.https(
+            'zjuam.zju.edu.cn', '/cas/login', {'service': service.toString()});
 
     try {
       // execution 与初始 Cookie/JSESSIONID 属于同一次 CAS 表单会话，必须
