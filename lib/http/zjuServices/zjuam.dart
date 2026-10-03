@@ -197,10 +197,11 @@ class ZjuAm {
   /// 而带 service 的登录 POST 实测通过 service 白名单（垃圾凭据返回密码
   /// 错误表单，而非「未认证授权服务」页）。
   ///
-  /// 返回的是登录 POST 下发的**全部**会话 Cookie（iPlanetDirectoryPro +
-  /// CASTGC 等）：tgmedia 的 OpenAM Agent 认 iPlanet，而后续的
-  /// zjuam CAS OAuth2.0/authorize 认 CASTGC（1.3.5.15 实测：只带 iPlanet
-  /// 时 authorize 被踢回登录表单，链路卡死）。由调用方按域归档。
+  /// 返回整个登录流程（表单 → 公钥 → 登录 POST）累计的**全部**会话
+  /// Cookie（iPlanetDirectoryPro + JSESSIONID/CASTGC 等）：tgmedia 的
+  /// OpenAM Agent 认 iPlanet，而后续的 zjuam CAS OAuth2.0/authorize 认
+  /// CAS 自己的会话——1.3.5.16 只回传 POST 响应 Cookie 时 authorize 仍
+  /// 被踢回登录表单（ssoHop 日志实测）。由调用方按域归档。
   static Future<(List<Cookie>, Uri)> loginForServiceCallback(
     HttpClient httpClient,
     String username,
@@ -327,25 +328,36 @@ class ZjuAm {
       if (iPlanet != null) {
         // 登录成功——判据只看一件事：CAS 校验凭据并签发了 iPlanet，
         // 不再猜测 302 Location 形态（1.3.5.13 曾因宿主比对误判失败）。
-        // 跳转目标：Location 带 ticket= 走票据回调；其余从 service 入口
-        // 起链（tgmedia 的 OpenAM Agent 认 iPlanet，302 无票）。
-        final sessionCookies = <Cookie>[];
-        for (final cookie in response.cookies) {
-          if (cookie.name.trim().isEmpty || cookie.value.trim().isEmpty) {
-            continue;
+        //
+        // 会话 Cookie 全量回传（按名去重，登录 POST 响应优先）：CAS 的
+        // SSO 会话可能落在表单阶段的 JSESSIONID / CASTGC 上——1.3.5.16
+        // 只回传 POST 响应 Cookie，oauth2.0/authorize 仍认不出会话，
+        // 被踢回登录表单（ssoHop 日志实测）。
+        final merged = <String, Cookie>{};
+        void collect(List<Cookie> list) {
+          for (final cookie in list) {
+            if (cookie.name.trim().isEmpty || cookie.value.trim().isEmpty) {
+              continue;
+            }
+            if (cookie.maxAge != null && cookie.maxAge! <= 0) continue;
+            if (cookie.expires != null && !cookie.expires!.isAfter(now)) {
+              continue;
+            }
+            merged[cookie.name] = cookie;
           }
-          if (cookie.maxAge != null && cookie.maxAge! <= 0) continue;
-          if (cookie.expires != null && !cookie.expires!.isAfter(now)) {
-            continue;
-          }
-          if (cookie.domain == null || cookie.domain!.trim().isEmpty) {
-            cookie.domain = 'zjuam.zju.edu.cn';
-          }
-          if (cookie.path == null || cookie.path!.trim().isEmpty) {
-            cookie.path = '/';
-          }
-          sessionCookies.add(cookie);
         }
+
+        collect(cookies); // 表单 + 公钥阶段累计
+        collect(response.cookies); // 登录 POST 响应，覆盖同名旧值
+        final sessionCookies = merged.values.map((cookie) {
+          var domain = (cookie.domain ?? '').trim();
+          if (domain.startsWith('.')) domain = domain.substring(1);
+          if (domain.isEmpty) domain = 'zjuam.zju.edu.cn';
+          final path = (cookie.path ?? '').trim();
+          return Cookie(cookie.name, cookie.value)
+            ..domain = domain
+            ..path = path.isEmpty ? '/' : path;
+        }).toList();
         return (
           sessionCookies,
           (location != null && location.contains('ticket='))

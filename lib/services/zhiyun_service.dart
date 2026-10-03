@@ -141,6 +141,13 @@ class ZhiyunService {
             cookie.value);
       }
     }
+    // Cookie 名单（仅名字，不含值）：authorize 是否放行可直接对账。
+    DiagnosticLogService.instance.record(
+      module: 'zhiyun',
+      operation: 'ssoCookies',
+      message:
+          '链路会话 Cookie：${sessionCookies.map((c) => c.name).join('、')}',
+    );
 
     var currentUrl = chainStart;
     var reachedClassroom = false;
@@ -197,8 +204,7 @@ class ZhiyunService {
       if (target != null) {
         currentUrl = target;
         continue;
-      }
-      reachedClassroom = currentUrl.host == 'classroom.zju.edu.cn' ||
+      }      reachedClassroom = currentUrl.host == 'classroom.zju.edu.cn' ||
           body.contains('classroom.zju.edu.cn') ||
           body.contains('_token');
       lastBody = body;
@@ -292,10 +298,30 @@ class ZhiyunService {
       final match = pattern.firstMatch(body);
       if (match != null) {
         final resolvedHtml = _resolveRedirect(current, match.group(1));
-        if (resolvedHtml != null) return resolvedHtml;
+        if (resolvedHtml != null &&
+            _isTrustedInlineTarget(current, resolvedHtml)) {
+          return resolvedHtml;
+        }
       }
     }
     return null;
+  }
+
+  /// 页面内联（HTML/JS）跳转只信任本站与已参与本链路的浙大主机：
+  /// CAS 登录表单等页面嵌着的历史系统链接（如 zuinfo）会被 `url=`
+  /// 类宽泛正则误认成跳转目标（1.3.5.16 实测 zuinfo 幽灵跳转）。
+  /// Location / Refresh 头是服务端下发的，不经此过滤。
+  static bool _isTrustedInlineTarget(Uri current, Uri target) {
+    if (target.host == current.host) return true;
+    const trustedHosts = {
+      'zjuam.zju.edu.cn',
+      'classroom.zju.edu.cn',
+      'tgmedia.cmc.zju.edu.cn',
+      'yjapi.cmc.zju.edu.cn',
+      'courses.zju.edu.cn',
+      'identity.zju.edu.cn',
+    };
+    return trustedHosts.contains(target.host);
   }
 
   static Uri? _resolveRedirect(Uri current, String? target) {
