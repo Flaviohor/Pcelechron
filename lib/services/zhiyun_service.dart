@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:celechron/database/database_helper.dart';
+import 'package:celechron/http/zjuServices/exceptions.dart';
 import 'package:celechron/http/zjuServices/response_utils.dart';
 import 'package:celechron/http/zjuServices/zjuam.dart';
 import 'package:celechron/services/diagnostic_log_service.dart';
@@ -96,56 +97,154 @@ class ZhiyunService {
     return token;
   }
 
-  /// CAS 换票 → 智云 token 回调 → JWT。
+  /// 浏览器式全程跟随登录：
+  ///
+  /// 直连 zjuam CAS 的 service 入口在 Keycloak 迁移后被拒（1.3.5 实测
+  /// HTTP 500）。与 classroom 页面自身的跳转保持一致：未认证请求
+  /// `/api/login/token` 会 302 到 identity.zju.edu.cn 的 Keycloak CAS
+  /// （service=https%3A//classroom.zju.edu.cn/api/login/token），经 broker
+  /// 绕 zjuam 验证 iPlanet 后带票回到 classroom 下发 JWT。逐跳带 Cookie、
+  /// 收 Cookie，落点响应体 / Set-Cookie / classroom 域 Cookie 里取 token。
   static Future<String> _loginZhiyun(String username, String password) async {
     final iPlanet = await ZjuAm.getSsoCookie(_client, username, password);
     if (iPlanet == null) {
       throw const ZhiyunException('统一认证未登录');
     }
-    final Uri callback;
-    try {
-      callback = await ZjuAm.getServiceCallback(
-        _client,
-        iPlanet,
-        Uri.parse(_tokenCallbackUrl),
-        context: '智云课堂 CAS',
-      );
-    } on Exception catch (error) {
-      final message = error.toString().split('\n').first.trim();
-      throw ZhiyunException(message.isEmpty
-          ? '智云课堂统一认证失败'
-          : '智云课堂统一认证失败（$message）');
+
+    final jar = <String, Cookie>{};
+
+    String cookieKey(Cookie cookie, Uri source) {
+      final domain = (cookie.domain?.trim().isNotEmpty == true
+              ? cookie.domain!.trim()
+              : source.host)
+          .toLowerCase()
+          .replaceFirst(RegExp(r'^\.'), '');
+      final path =
+          cookie.path?.trim().isNotEmpty == true ? cookie.path!.trim() : '/';
+      return '${cookie.name}|$domain|$path';
     }
 
-    // 访问 token 回调：JWT 在响应体或 Set-Cookie 中。
-    final request = await _client.getUrl(callback).timeout(
-          const Duration(seconds: 10),
-          onTimeout: () => throw const ZhiyunException('智云课堂请求超时'),
+    bool isExpired(Cookie cookie) {
+      if (cookie.maxAge != null && cookie.maxAge! <= 0) return true;
+      final expires = cookie.expires;
+      return expires != null && expires.isBefore(DateTime.now());
+    }
+
+    void storeAll(List<Cookie> cookies, Uri source) {
+      for (final cookie in cookies) {
+        if (cookie.name.trim().isEmpty) continue;
+        final key = cookieKey(cookie, source);
+        if (isExpired(cookie)) {
+          jar.remove(key);
+          continue;
+        }
+        if (cookie.domain == null || cookie.domain!.trim().isEmpty) {
+          cookie.domain = source.host.toLowerCase();
+        }
+        if (cookie.path == null || cookie.path!.trim().isEmpty) {
+          cookie.path = '/';
+        }
+        jar[key] = cookie;
+      }
+    }
+
+    bool matchesUri(Cookie cookie, Uri uri) {
+      if (isExpired(cookie)) return false;
+      if (cookie.secure && uri.scheme != 'https') return false;
+      final domain = (cookie.domain ?? '')
+          .trim()
+          .toLowerCase()
+          .replaceFirst(RegExp(r'^\.'), '');
+      if (domain.isEmpty) return false;
+      final host = uri.host.toLowerCase();
+      if (host != domain && !host.endsWith('.$domain')) return false;
+      final path =
+          cookie.path == null || cookie.path!.isEmpty ? '/' : cookie.path!;
+      return uri.path.startsWith(path);
+    }
+
+    final trustedSsoCookie = Cookie(iPlanet.name, iPlanet.value)
+      ..domain = iPlanet.domain ?? 'zju.edu.cn'
+      ..path = '/'
+      ..secure = iPlanet.secure;
+    storeAll([trustedSsoCookie], Uri.parse('https://zjuam.zju.edu.cn/'));
+
+    var current = Uri.parse(_tokenCallbackUrl);
+    final stopwatch = Stopwatch()..start();
+    final hopTrace = <String>[];
+
+    for (var hop = 0; hop < 16; hop++) {
+      if (stopwatch.elapsed > const Duration(seconds: 45)) {
+        throw const ZhiyunException('智云课堂登录链路超时');
+      }
+      final HttpClientRequest request;
+      try {
+        request = await _client.getUrl(current).timeout(
+              const Duration(seconds: 10),
+              onTimeout: () => throw const ZhiyunException('智云课堂请求超时'),
+            );
+      } on SocketException catch (error) {
+        DiagnosticLogService.instance.record(
+          module: 'zhiyun',
+          operation: 'loginHopError',
+          requestUri: current,
+          error: error,
         );
-    request.followRedirects = true;
-    request.headers.set('User-Agent', _userAgent);
-    request.cookies.add(Cookie(iPlanet.name, iPlanet.value));
-    final response = await request.close().timeout(
-          const Duration(seconds: 10),
-          onTimeout: () => throw const ZhiyunException('智云课堂请求超时'),
-        );
-    final body = await _readBodyWithTimeout(response);
-    final token = _extractToken(body, response);
-    if (token == null || token.isEmpty) {
+        throw ZhiyunException('无法解析或连接 ${current.host}；需校园网/VPN');
+      }
+      request.followRedirects = false;
+      request.headers.set('User-Agent', _userAgent);
+      request.cookies.addAll(jar.values.where((c) => matchesUri(c, current)));
+      final response = await request.close().timeout(
+            const Duration(seconds: 10),
+            onTimeout: () => throw const ZhiyunException('智云课堂请求超时'),
+          );
+      storeAll(List<Cookie>.from(response.cookies), current);
+      final location = response.headers.value(HttpHeaders.locationHeader);
+      final body = await _readBodyWithTimeout(response);
+      DiagnosticLogService.instance.record(
+        module: 'zhiyun',
+        operation: 'loginHop',
+        requestUri: current,
+        statusCode: response.statusCode,
+        location: location,
+        message: 'zhiyun 登录第${hop + 1}跳',
+      );
+
+      if (isHttpRedirectStatus(response.statusCode) &&
+          location != null &&
+          location.trim().isNotEmpty) {
+        hopTrace.add('${sanitizedRequestUri(current)} → HTTP '
+            '${response.statusCode} → ${location.trim()}');
+        current = current.resolve(location);
+        continue;
+      }
+
+      // 落点：classroom 的 token 响应。JWT 可能在响应体、Set-Cookie，
+      // 或此前跳中下发的 classroom 域 Cookie 里。
+      final token = _extractToken(body, response, jar);
+      if (token != null && token.isNotEmpty) {
+        return token;
+      }
       DiagnosticLogService.instance.record(
         module: 'zhiyun',
         operation: 'tokenCallback',
-        requestUri: callback,
+        requestUri: current,
         statusCode: response.statusCode,
-        message: 'token 回调未含 JWT',
+        message: '登录落点未含 JWT',
         error: body.length > 200 ? body.substring(0, 200) : body,
       );
-      throw const ZhiyunException('智云课堂未下发 token');
+      throw ZhiyunException(
+          '智云课堂未下发 token（落点 ${current.host}，HTTP ${response.statusCode}）');
     }
-    return token;
+    throw ExceptionWithMessage(
+      '智云课堂登录失败：重定向次数过多',
+      details: hopTrace.join('\n'),
+    );
   }
 
-  static String? _extractToken(String body, HttpClientResponse response) {
+  static String? _extractToken(
+      String body, HttpClientResponse response, Map<String, Cookie> jar) {
     try {
       final payload = decodeJsonMap(body, context: '智云 token 回调');
       final candidates = [
@@ -160,13 +259,18 @@ class ZhiyunService {
         if (value.isNotEmpty) return value;
       }
     } on Object {
-      // 响应不是 JSON：继续尝试 Set-Cookie。
+      // 响应不是 JSON：继续尝试 Cookie。
     }
     for (final cookie in response.cookies) {
       final value = cookie.value.trim();
       if (value.startsWith('eyJ') && value.length > 40) {
         return value;
       }
+    }
+    for (final cookie in jar.values) {
+      if (!cookie.name.contains('token') && cookie.name != '_token') continue;
+      final value = cookie.value.trim();
+      if (value.isNotEmpty && !value.contains(';s:')) return value;
     }
     return null;
   }

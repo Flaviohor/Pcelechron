@@ -520,8 +520,6 @@ class Scholar {
     // 全新用户（原本就没有作业）不受影响。
     if (errorResult[3] == false && (tempTodos.isNotEmpty || todos.isEmpty)) {
       todos = tempTodos;
-      // 作业同步进任务列表（幂等，按 fromUid 去重，截止时间变更自动更新）。
-      TodoTaskSync.sync(todos);
     } else if (errorResult[3] == false && tempTodos.isEmpty) {
       DiagnosticLogService.instance.record(
         level: CelechronLogLevel.warning,
@@ -530,6 +528,10 @@ class Scholar {
         message: '作业模块成功但返回空列表，已保留原有 ${todos.length} 条作业',
       );
     }
+    // 作业同步进任务列表（幂等，按 fromUid 去重，截止时间变更自动更新）。
+    // 放在守卫之外：即便本轮抓取失败或整体被中止，只要手上有（缓存的）
+    // 作业数据就同步一次，任务页作业卡片不依赖单次刷新的成败。
+    TodoTaskSync.sync(todos);
     if (tempPracticeSnapshot != null) {
       // 详情仍只采用 getSqjl；汇总独立采用 getMyInfo 的三级回退结果。
       final snapshot = tempPracticeSnapshot;

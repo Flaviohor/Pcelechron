@@ -78,74 +78,165 @@ class Zdbk {
 
   Future<bool> _doLogin(
       HttpClient httpClient, Cookie iPlanetDirectoryPro) async {
-    late HttpClientRequest request;
-    late HttpClientResponse response;
-
     _captcha = null;
     _jSessionId = null;
     _route = null;
-    // 第一步用统一认证 Cookie 换取 service 跳转；第二步访问跳转地址，
-    // 业务站才会签发必须成对使用的 JSESSIONID 与 route。
-    request = await httpClient
-        .getUrl(Uri.parse(
-            "https://zjuam.zju.edu.cn/cas/login?service=https%3A%2F%2Fzdbk.zju.edu.cn%2Fjwglxt%2Fxtgl%2Flogin_ssologin.html"))
-        .timeout(const Duration(seconds: 8),
-            onTimeout: () => throw requestTimeout());
-    request.followRedirects = false;
-    request.cookies.add(iPlanetDirectoryPro);
-    response = await request.close().timeout(const Duration(seconds: 8),
-        onTimeout: () => throw requestTimeout());
-    final firstBody = await readResponseBody(response, context: '教务网 CAS 登录');
 
-    var stLocation = response.headers.value('location');
-    if (!response.isRedirect || stLocation == null) {
-      throw AuthenticationExpiredException(
-          "教务网登录：统一身份认证凭据无效；HTTP ${response.statusCode}"
-          "；Location ${stLocation ?? '<缺失>'}"
-          "；响应摘要：${responseSummary(firstBody)}");
-    } else if (stLocation.startsWith("http://")) {
-      stLocation = stLocation.replaceFirst("http://", "https://");
-    }
-    request = await httpClient.getUrl(Uri.parse(stLocation)).timeout(
-        const Duration(seconds: 8),
-        onTimeout: () => throw requestTimeout());
-    request.followRedirects = false;
-    response = await request.close().timeout(const Duration(seconds: 8),
-        onTimeout: () => throw requestTimeout());
-    final secondBody = await readResponseBody(response, context: '教务网登录');
-    if (response.statusCode == HttpStatus.unauthorized ||
-        response.statusCode == HttpStatus.forbidden ||
-        bodyIndicatesAuthenticationFailure(secondBody)) {
-      throw AuthenticationExpiredException(
-          "教务网登录态失效；HTTP ${response.statusCode}"
-          "；Location ${response.headers.value(HttpHeaders.locationHeader) ?? '<缺失>'}"
-          "；响应摘要：${responseSummary(secondBody)}");
-    }
-    if (response.statusCode < 200 || response.statusCode >= 400) {
-      throw ExceptionWithMessage("教务网登录失败；HTTP ${response.statusCode}"
-          "；Content-Type ${response.headers.value(HttpHeaders.contentTypeHeader) ?? '<缺失>'}"
-          "；响应摘要：${responseSummary(secondBody)}");
+    // 现代统一认证（Keycloak broker 迁移后）不再是「一步换票、二步落地」：
+    // zdbk 未认证请求会 302 到 identity.zju.edu.cn 的 Keycloak CAS
+    // （service=login_ssologin.html），经 broker 绕 zjuam 验证后带票回到
+    // 业务站。旧两步式在迁移后 302 到 Keycloak logout 而失败，且
+    // Scholar.refresh 会因登录失败中止整套抓取（课表/成绩/作业全部停抓）。
+    // 改为浏览器式全程跟随：逐跳带 Cookie、收 Cookie，直到落回
+    // zdbk.zju.edu.cn 非重定向响应，JSESSIONID 与 route 从全链收集的
+    // Cookie 中取。
+    final jar = <String, Cookie>{};
+
+    String cookieKey(Cookie cookie, Uri source) {
+      final domain = (cookie.domain?.trim().isNotEmpty == true
+              ? cookie.domain!.trim()
+              : source.host)
+          .toLowerCase()
+          .replaceFirst(RegExp(r'^\.'), '');
+      final path =
+          cookie.path?.trim().isNotEmpty == true ? cookie.path!.trim() : '/';
+      return '${cookie.name}|$domain|$path';
     }
 
-    if (response.cookies.any((element) => element.name == 'JSESSIONID')) {
-      _jSessionId = response.cookies
-          .firstWhere((element) => element.name == 'JSESSIONID');
-    } else {
-      throw ExceptionWithMessage(
-          "教务网登录无法获取 JSESSIONID；HTTP ${response.statusCode}"
-          "；响应摘要：${responseSummary(secondBody)}");
+    bool isExpired(Cookie cookie) {
+      if (cookie.maxAge != null && cookie.maxAge! <= 0) return true;
+      final expires = cookie.expires;
+      return expires != null && expires.isBefore(DateTime.now());
     }
 
-    if (response.cookies.any((element) => element.name == 'route')) {
-      _route =
-          response.cookies.firstWhere((element) => element.name == 'route');
-    } else {
-      throw ExceptionWithMessage("教务网登录无法获取 route；HTTP ${response.statusCode}"
-          "；响应摘要：${responseSummary(secondBody)}");
+    void storeAll(List<Cookie> cookies, Uri source) {
+      for (final cookie in cookies) {
+        if (cookie.name.trim().isEmpty) continue;
+        final key = cookieKey(cookie, source);
+        if (isExpired(cookie)) {
+          jar.remove(key);
+          continue;
+        }
+        if (cookie.domain == null || cookie.domain!.trim().isEmpty) {
+          cookie.domain = source.host.toLowerCase();
+        }
+        if (cookie.path == null || cookie.path!.trim().isEmpty) {
+          cookie.path = '/';
+        }
+        jar[key] = cookie;
+      }
     }
 
-    _sessionGeneration++;
-    return true;
+    bool matchesUri(Cookie cookie, Uri uri) {
+      if (isExpired(cookie)) return false;
+      if (cookie.secure && uri.scheme != 'https') return false;
+      final domain =
+          (cookie.domain ?? '').trim().toLowerCase().replaceFirst(RegExp(r'^\.'), '');
+      if (domain.isEmpty) return false;
+      final host = uri.host.toLowerCase();
+      if (host != domain && !host.endsWith('.$domain')) return false;
+      final path =
+          cookie.path == null || cookie.path!.isEmpty ? '/' : cookie.path!;
+      return uri.path.startsWith(path);
+    }
+
+    final trustedSsoCookie =
+        Cookie(iPlanetDirectoryPro.name, iPlanetDirectoryPro.value)
+          ..domain = iPlanetDirectoryPro.domain ?? 'zju.edu.cn'
+          ..path = '/'
+          ..secure = iPlanetDirectoryPro.secure;
+    storeAll([trustedSsoCookie], Uri.parse('https://zjuam.zju.edu.cn/'));
+
+    // 起点与浏览器一致：业务站单点登录入口（未认证时会 302 到 CAS）。
+    var current = Uri.parse(
+        'https://zdbk.zju.edu.cn/jwglxt/xtgl/login_ssologin.html');
+    final hopTrace = <String>[];
+
+    for (var hop = 0; hop < 16; hop++) {
+      final request = await httpClient.getUrl(current).timeout(
+          const Duration(seconds: 8), onTimeout: () => throw requestTimeout());
+      request.followRedirects = false;
+      request.cookies.addAll(jar.values.where((c) => matchesUri(c, current)));
+      final response = await request.close().timeout(
+          const Duration(seconds: 8), onTimeout: () => throw requestTimeout());
+      storeAll(List<Cookie>.from(response.cookies), current);
+      final location = response.headers.value(HttpHeaders.locationHeader);
+      final body = await readResponseBody(response, context: '教务网登录');
+      DiagnosticLogService.instance.record(
+        level: isHttpRedirectStatus(response.statusCode)
+            ? CelechronLogLevel.debug
+            : CelechronLogLevel.info,
+        module: '教务网登录',
+        operation: 'redirectHop',
+        requestUri: current,
+        statusCode: response.statusCode,
+        location: location,
+        message: 'zdbk 登录第${hop + 1}跳',
+      );
+
+      if (isHttpRedirectStatus(response.statusCode) &&
+          location != null &&
+          location.trim().isNotEmpty) {
+        hopTrace.add('${sanitizedRequestUri(current)} → HTTP '
+            '${response.statusCode} → ${location.trim()}');
+        current = current.resolve(location);
+        continue;
+      }
+
+      // 非重定向：落点。
+      if (response.statusCode == HttpStatus.unauthorized ||
+          response.statusCode == HttpStatus.forbidden ||
+          bodyIndicatesAuthenticationFailure(body)) {
+        throw AuthenticationExpiredException(
+          '教务网登录态失效；HTTP ${response.statusCode}',
+          details: [...hopTrace, '响应摘要：${responseSummary(body)}'].join('\n'),
+        );
+      }
+      if (response.statusCode < 200 || response.statusCode >= 400) {
+        throw ExceptionWithMessage(
+          '教务网登录失败；HTTP ${response.statusCode}',
+          details: [...hopTrace, '响应摘要：${responseSummary(body)}'].join('\n'),
+        );
+      }
+
+      // 业务站的 JSESSIONID 与 route 可能在前面的跳里就已下发，从全链
+      // Cookie 中取（只认 zdbk 域）。
+      Cookie? jsessionId;
+      Cookie? route;
+      for (final cookie in jar.values) {
+        final domain = (cookie.domain ?? '')
+            .trim()
+            .toLowerCase()
+            .replaceFirst(RegExp(r'^\.'), '');
+        final onZdbk =
+            domain == 'zdbk.zju.edu.cn' || 'zdbk.zju.edu.cn'.endsWith('.$domain');
+        if (!onZdbk) continue;
+        if (cookie.name == 'JSESSIONID' && jsessionId == null) {
+          jsessionId = cookie;
+        } else if (cookie.name == 'route' && route == null) {
+          route = cookie;
+        }
+      }
+      if (jsessionId == null || route == null) {
+        throw ExceptionWithMessage(
+          '教务网登录无法获取 JSESSIONID 或 route；HTTP ${response.statusCode}',
+          details: [
+            ...hopTrace,
+            '已收集的 zdbk 域 Cookie：'
+                '${jar.values.where((c) => (c.domain ?? '').contains('zdbk')).map((c) => c.name).join('、')}',
+          ].join('\n'),
+        );
+      }
+      _jSessionId = jsessionId;
+      _route = route;
+      _sessionGeneration++;
+      return true;
+    }
+
+    throw ExceptionWithMessage(
+      '教务网登录失败：重定向次数过多',
+      details: hopTrace.join('\n'),
+    );
   }
 
   void logout() {

@@ -19,6 +19,7 @@ import 'package:celechron/database/database_helper.dart';
 import 'package:celechron/database/hive_paths.dart';
 import 'package:celechron/design/glass.dart';
 import 'package:celechron/http/zju_ingress_fallback.dart';
+import 'package:celechron/services/todo_task_sync.dart';
 import 'package:celechron/services/app_update_service.dart';
 import 'package:celechron/services/desktop_tray_service.dart';
 import 'package:celechron/utils/global.dart';
@@ -107,6 +108,10 @@ void main() async {
   Get.put(db.getFlowListUpdateTime().obs, tag: 'flowListLastUpdate');
   Get.put(db.getOption(), tag: 'option');
   Get.put(db.getFuse().obs, tag: 'fuse');
+
+  // 启动时把（缓存的）学在浙大作业同步进任务列表：作业卡片立即可见，
+  // 不依赖启动刷新是否成功（刷新失败时仍是上次缓存的作业）。
+  TodoTaskSync.sync(Get.find<Rx<Scholar>>(tag: 'scholar').value.todos);
 
   // 托盘常驻依赖「关窗驻留」选项，因此放在 Option 注册之后启动。
   await DesktopTrayService.instance.start();
