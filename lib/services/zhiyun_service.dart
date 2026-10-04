@@ -234,6 +234,15 @@ class ZhiyunService {
         message: '登录落点未含 JWT',
         error: body.length > 200 ? body.substring(0, 200) : body,
       );
+      // identity 的 CAS 端点按站点注册表匹配 service：迁移未接入的站点
+      // 一律 400「客户端未找到」（实测 classroom/zdbk 等均未注册，仅
+      // courses 已接入）。这不是客户端可绕过的状态，给用户可读的解释。
+      if (current.host == 'identity.zju.edu.cn' &&
+          response.statusCode == HttpStatus.badRequest) {
+        throw const ZhiyunException(
+            '智云课堂登录暂不可用（学校统一认证迁移中，该站点尚未接入）；'
+            '可先在浏览器打开智云课堂');
+      }
       throw ZhiyunException(
           '智云课堂未下发 token（落点 ${current.host}，HTTP ${response.statusCode}）');
     }

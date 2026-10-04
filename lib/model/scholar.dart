@@ -226,8 +226,23 @@ class Scholar {
           // 同一个 refresh Future。
           if (!isLogan || _spider == null) {
             final loginErrors = await _loginInternal();
-            if (loginErrors.any((error) => error != null)) {
+            // 仅当统一身份认证本身失败（凭据无效等）时中止——那是全站无
+            // 会话可用的情形。**单个子站登录失败不再中止整套抓取**：统一
+            // 认证迁移期个别站点未接入时（如 zdbk/classroom 在 identity
+            // 尚未注册），各模块自带缓存降级，可用模块（学在浙大作业、
+            // 校历等）照常更新，而不是全军覆没（10-01 起作业/课表全部
+            // 停抓即因此处整体 return 所致）。
+            if (loginErrors.isNotEmpty && loginErrors.first != null) {
               return loginErrors;
+            }
+            for (final loginError in loginErrors) {
+              if (loginError == null) continue;
+              DiagnosticLogService.instance.record(
+                level: CelechronLogLevel.warning,
+                module: '刷新登录',
+                operation: 'partialFailure',
+                message: '子站登录失败，模块将独立降级：$loginError',
+              );
             }
           }
           // Workmanager 可能略早于前台 main isolate 启动。后台完成登录后

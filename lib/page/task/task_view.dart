@@ -26,6 +26,30 @@ class TaskPage extends StatelessWidget {
     return '${(deadline.getProgress() * 100).toInt()}% 已完成：预期 ${durationToString(deadline.timeNeeded)}，还要 ${durationToString(deadline.timeNeeded <= deadline.timeSpent ? Duration.zero : (deadline.timeNeeded - deadline.timeSpent))}';
   }
 
+  /// 学在浙大作业提交深链：优先由任务字段拼装（courseId + fromUid 里的
+  /// 活动 id，`?view=scores` 直达提交区），字段不全时回退到 description
+  /// 里同步时写入的提交地址。
+  Future<void> openHomeworkSubmit(Task deadline) async {
+    String? url;
+    final fromUid = deadline.fromUid;
+    final courseId = deadline.courseId ?? '';
+    if (fromUid != null &&
+        fromUid.startsWith('courses-todo:') &&
+        courseId.isNotEmpty) {
+      final activityId = fromUid.substring('courses-todo:'.length);
+      if (activityId.isNotEmpty) {
+        url =
+            'https://courses.zju.edu.cn/course/$courseId/learning-activity#/$activityId?view=scores';
+      }
+    }
+    url ??= RegExp(r'提交：(https://\S+)')
+        .firstMatch(deadline.description)
+        ?.group(1);
+    if (url != null && url.isNotEmpty) {
+      await launchUrlString(url, mode: LaunchMode.externalApplication);
+    }
+  }
+
   Future<void> showCardDialog(BuildContext context, Task deadline) async {
     return showDialog<void>(
       context: context,
@@ -431,29 +455,32 @@ class TaskPage extends StatelessWidget {
                             ),
                           ),
                         ),
-                        CupertinoButton(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 10, vertical: 2),
-                          minimumSize: const Size(0, 0),
-                          color: CupertinoColors.activeBlue,
-                          borderRadius: BorderRadius.circular(12),
-                          onPressed: () {
-                            final submitUrl = RegExp(r'提交：(https://\S+)')
-                                .firstMatch(deadline.description)
-                                ?.group(1);
-                            if (submitUrl != null) {
-                              launchUrlString(submitUrl,
-                                  mode: LaunchMode.externalApplication);
-                            }
-                          },
-                          child: const Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(CupertinoIcons.paperplane_fill,
-                                  size: 12),
-                              SizedBox(width: 4),
-                              Text('去提交', style: TextStyle(fontSize: 12)),
-                            ],
+                        GestureDetector(
+                          onTap: () => openHomeworkSubmit(deadline),
+                          behavior: HitTestBehavior.opaque,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 10, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: CupertinoColors.activeBlue,
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(CupertinoIcons.paperplane_fill,
+                                    size: 11, color: CupertinoColors.white),
+                                SizedBox(width: 4),
+                                Text(
+                                  '去提交',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: CupertinoColors.white,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
                         ),
                       ],
