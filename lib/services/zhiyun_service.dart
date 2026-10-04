@@ -3,59 +3,61 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:celechron/database/database_helper.dart';
-import 'package:celechron/http/zjuServices/exceptions.dart';
 import 'package:celechron/http/zjuServices/response_utils.dart';
 import 'package:celechron/http/zjuServices/zjuam.dart';
 import 'package:celechron/services/diagnostic_log_service.dart';
 import 'package:crypto/crypto.dart';
 import 'package:get/get.dart';
 
-/// 智云课堂（Zhiyun, classroom.zju.edu.cn）服务——按《智云课堂与作业提交
-/// 功能开发总结及实现方案》（Helechron 移植项目文档）实现。
+/// 智云课堂（Zhiyun, classroom.zju.edu.cn）服务。
 ///
-/// ## 鉴权：zjuam CAS 换票 → 智云 token 接口直通（文档·2.1）
+/// 登录与数据管线**完整移植自 Helechron 项目**（github.com/Kepler16f/
+/// Helechron，lib/services/zhiyun_service.dart，2026-10 实测可用）：
 ///
-/// 1. 统一认证持有根会话 Cookie `iPlanetDirectoryPro`（ZjuAm.getSsoCookie）；
-/// 2. 携带它请求 `zjuam/cas/login?service=<classroom/api/login/token>`，
-///    CAS 302 带票跳到 `classroom.zju.edu.cn/api/login/token?ticket=ST-x`；
-/// 3. 访问该回调，智云在响应体/Set-Cookie 中下发 JWT；
-/// 4. 之后所有智云 API 携带 `Authorization: Bearer <token>` 与
-///    `x-tenant-code: 112`（缺 tenant 头会 401/403）。
+/// ## 登录（tgmedia 入口 + 扁平 Cookie 罐）
 ///
-/// Token 双层缓存与自愈：内存 `_cachedZhiyunToken` + optionsBox
-/// `zhiyun_token` 持久化；任何 API 遇 401 即清缓存重登并重放。
+/// 1. `ZjuAm.getSsoCookie` 取得 iPlanetDirectoryPro；
+/// 2. 从 tgmedia 认证入口起（index.php?r=auth/login&auType=cmc&
+///    tenant_code=112&forward=…classroom…），跟随最多 12 跳 302，逐跳
+///    带/收 Cookie——**Cookie 罐按 name|domain 扁平存**（不做 path 维度
+///    划分，避免同名多 path 的旧 Cookie 混入链路破坏会话）；
+/// 3. `_token` 从 Cookie（含 PHP 序列化形态）、URL query 参数三处提取，
+///    **不限定域名**（tgmedia 域下发的 _token 可直接作 classroom API 的
+///    Bearer）；
+/// 4. `/userapi/v1/infosimple` 校验并拉取学号与用户 ID。
 ///
-/// ## 核心 API（文档·2.2）
+/// 历史教训：zjuam 直连 CAS 的 service=classroom 已被服务端拒绝（no_auth/
+/// 500），identity Keycloak 迁移当前未接入 classroom（400 客户端未找到），
+/// 因此此 tgmedia 链是当前唯一可用路径。
 ///
-/// - `POST /api/course/get-user-courses`：当前用户全部课程；
-/// - `GET  /api/course/get-course-catalogue?course_id=`：课节目录（录播）；
-/// - `POST /api/course/search-courses`：全局搜索（兜底）。
+/// ## 数据接口（Helechron 同款）
 ///
-/// ## 课程匹配（文档·2.3）
+/// - `courseapi/v3/multi-search/get-course-detail?course_id=`（sub_list）；
+/// - `courseapi/v2/course/catalogue?course_id=`（备用目录）；
+/// - `pptnote/v1/searchlist?tenant_id=112&title=&realname=`（在线检索）。
 ///
-/// 名称清洗与梯队匹配沿用本文件底部助手；命中候选再按打分择优：
-/// 当前学期 +100、教师命中 +50、核心课名全等 +80。
-///
-/// ## PHP 后端异构防御
-///
-/// 关联数组经 json_encode 会变 Object（Map），空表/连续索引则是 Array
-/// （List）：解析一律 List/Map 双形态兼容，严禁 as List 强转。
+/// 所有请求带 `Authorization: Bearer <token>` 与
+/// `Cookie: _token=<token>; token=<token>`（Helechron 实测必需）。
 class ZhiyunService {
   ZhiyunService._();
 
   static const _userAgent =
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-      '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+      '(KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36';
+
   static const _zhiyunBase = 'https://classroom.zju.edu.cn';
-  static const _userCoursesUrl =
-      '$_zhiyunBase/api/course/get-user-courses';
-  static const _catalogueUrl = '$_zhiyunBase/api/course/get-course-catalogue';
-  static const _searchUrl = '$_zhiyunBase/api/course/search-courses';
-  static const _tokenCallbackUrl = '$_zhiyunBase/api/login/token';
   static const _tenantCode = '112';
 
-  /// Token 双层缓存：内存静态变量 + optionsBox 持久化。
+  /// tgmedia 认证入口：当前唯一可用的智云 SSO 起点。
+  static const _ssoEntryUrl =
+      'https://tgmedia.cmc.zju.edu.cn/index.php?r=auth/login&auType=cmc'
+      '&tenant_code=112&forward=https%3A%2F%2Fclassroom.zju.edu.cn%2F';
+
   static const _tokenKey = 'zhiyun_token';
+  static const _accountKey = 'zhiyun_account';
+  static const _userIdKey = 'zhiyun_user_id';
+
+  /// Token 双层缓存：内存静态变量 + optionsBox 持久化。
   static String? _cachedZhiyunToken;
 
   /// 显式绑定优先：只要曾经成功匹配过，强制视为可录播。
@@ -97,83 +99,52 @@ class ZhiyunService {
     return token;
   }
 
-  /// 浏览器式全程跟随登录：
-  ///
-  /// 直连 zjuam CAS 的 service 入口在 Keycloak 迁移后被拒（1.3.5 实测
-  /// HTTP 500）。与 classroom 页面自身的跳转保持一致：未认证请求
-  /// `/api/login/token` 会 302 到 identity.zju.edu.cn 的 Keycloak CAS
-  /// （service=https%3A//classroom.zju.edu.cn/api/login/token），经 broker
-  /// 绕 zjuam 验证 iPlanet 后带票回到 classroom 下发 JWT。逐跳带 Cookie、
-  /// 收 Cookie，落点响应体 / Set-Cookie / classroom 域 Cookie 里取 token。
+  static void _reloginZhiyun() {
+    _cachedZhiyunToken = null;
+    _db?.setCachedWebPage(_tokenKey, '');
+  }
+
+  /// tgmedia 入口全链跟随登录（Helechron 算法移植）。
   static Future<String> _loginZhiyun(String username, String password) async {
-    final iPlanet = await ZjuAm.getSsoCookie(_client, username, password);
-    if (iPlanet == null) {
+    final ssoCookie = await ZjuAm.getSsoCookie(_client, username, password);
+    if (ssoCookie == null) {
       throw const ZhiyunException('统一认证未登录');
     }
 
-    final jar = <String, Cookie>{};
+    // 扁平 Cookie 罐：按 name|domain 存，不做 path 维度划分——同名多 path
+    // 的旧 Cookie 混入链路会破坏 CAS 会话（此前自研链失败的教训之一）。
+    final cookieJar = <String, Cookie>{};
 
-    String cookieKey(Cookie cookie, Uri source) {
-      final domain = (cookie.domain?.trim().isNotEmpty == true
-              ? cookie.domain!.trim()
-              : source.host)
+    void storeCookie(Cookie cookie, Uri source) {
+      final domain = (cookie.domain == null || cookie.domain!.trim().isEmpty
+              ? source.host
+              : cookie.domain!)
           .toLowerCase()
           .replaceFirst(RegExp(r'^\.'), '');
-      final path =
-          cookie.path?.trim().isNotEmpty == true ? cookie.path!.trim() : '/';
-      return '${cookie.name}|$domain|$path';
+      cookie.path = '/';
+      cookieJar['${cookie.name}|$domain'] = cookie;
     }
 
-    bool isExpired(Cookie cookie) {
-      if (cookie.maxAge != null && cookie.maxAge! <= 0) return true;
-      final expires = cookie.expires;
-      return expires != null && expires.isBefore(DateTime.now());
-    }
-
-    void storeAll(List<Cookie> cookies, Uri source) {
-      for (final cookie in cookies) {
-        if (cookie.name.trim().isEmpty) continue;
-        final key = cookieKey(cookie, source);
-        if (isExpired(cookie)) {
-          jar.remove(key);
-          continue;
-        }
-        if (cookie.domain == null || cookie.domain!.trim().isEmpty) {
-          cookie.domain = source.host.toLowerCase();
-        }
-        if (cookie.path == null || cookie.path!.trim().isEmpty) {
-          cookie.path = '/';
-        }
-        jar[key] = cookie;
-      }
-    }
-
-    bool matchesUri(Cookie cookie, Uri uri) {
-      if (isExpired(cookie)) return false;
-      if (cookie.secure && uri.scheme != 'https') return false;
-      final domain = (cookie.domain ?? '')
-          .trim()
-          .toLowerCase()
-          .replaceFirst(RegExp(r'^\.'), '');
-      if (domain.isEmpty) return false;
+    List<Cookie> cookiesFor(Uri uri) {
       final host = uri.host.toLowerCase();
-      if (host != domain && !host.endsWith('.$domain')) return false;
-      final path =
-          cookie.path == null || cookie.path!.isEmpty ? '/' : cookie.path!;
-      return uri.path.startsWith(path);
+      return cookieJar.values.where((cookie) {
+        final domain = (cookie.domain ?? '')
+            .toLowerCase()
+            .replaceFirst(RegExp(r'^\.'), '');
+        return domain.isEmpty || host == domain || host.endsWith('.$domain');
+      }).toList();
     }
 
-    final trustedSsoCookie = Cookie(iPlanet.name, iPlanet.value)
-      ..domain = iPlanet.domain ?? 'zju.edu.cn'
-      ..path = '/'
-      ..secure = iPlanet.secure;
-    storeAll([trustedSsoCookie], Uri.parse('https://zjuam.zju.edu.cn/'));
+    final trustedSso = Cookie(ssoCookie.name, ssoCookie.value)
+      ..domain = 'zju.edu.cn'
+      ..path = '/';
+    storeCookie(trustedSso, Uri.parse('https://zjuam.zju.edu.cn/'));
 
-    var current = Uri.parse(_tokenCallbackUrl);
+    var current = Uri.parse(_ssoEntryUrl);
     final stopwatch = Stopwatch()..start();
-    final hopTrace = <String>[];
+    String? token;
 
-    for (var hop = 0; hop < 16; hop++) {
+    for (var hop = 0; hop < 12; hop++) {
       if (stopwatch.elapsed > const Duration(seconds: 45)) {
         throw const ZhiyunException('智云课堂登录链路超时');
       }
@@ -194,102 +165,129 @@ class ZhiyunService {
       }
       request.followRedirects = false;
       request.headers.set('User-Agent', _userAgent);
-      request.cookies.addAll(jar.values.where((c) => matchesUri(c, current)));
+      request.cookies.addAll(cookiesFor(current));
       final response = await request.close().timeout(
             const Duration(seconds: 10),
             onTimeout: () => throw const ZhiyunException('智云课堂请求超时'),
           );
-      storeAll(List<Cookie>.from(response.cookies), current);
+
+      for (final cookie in response.cookies) {
+        storeCookie(cookie, current);
+        final String decoded;
+        try {
+          decoded = Uri.decodeComponent(cookie.value);
+        } on ArgumentError {
+          continue;
+        }
+        // 1) PHP 序列化形态：{i:…;s:…:"_token";…s:…:"<token>";}
+        final match = RegExp(r'\{i:\d+;s:\d+:"_token";i:\d+;s:\d+:"([^"]+)";\}')
+            .firstMatch(decoded);
+        if (match != null) {
+          token = match.group(1);
+        }
+        // 2) 直接以 _token / token 命名的 Cookie
+        if (token == null && (cookie.name == '_token' || cookie.name == 'token')) {
+          if (decoded.contains('_token')) {
+            token = RegExp(r'"([^"]{20,})"').firstMatch(decoded)?.group(1) ??
+                cookie.value;
+          } else {
+            token = cookie.value;
+          }
+        }
+      }
+
+      // 3) URL query 参数里的 token / _token
+      if (current.queryParameters.containsKey('token')) {
+        token = current.queryParameters['token'];
+      }
+      if (current.queryParameters.containsKey('_token')) {
+        token = current.queryParameters['_token'];
+      }
+
       final location = response.headers.value(HttpHeaders.locationHeader);
-      final body = await _readBodyWithTimeout(response);
       DiagnosticLogService.instance.record(
         module: 'zhiyun',
         operation: 'loginHop',
         requestUri: current,
         statusCode: response.statusCode,
         location: location,
-        message: 'zhiyun 登录第${hop + 1}跳',
+        message: '登录第${hop + 1}跳'
+            '${token != null ? '（已获得 _token）' : ''}',
       );
+      await _readBodyWithTimeout(response);
 
       if (isHttpRedirectStatus(response.statusCode) &&
           location != null &&
-          location.trim().isNotEmpty) {
-        hopTrace.add('${sanitizedRequestUri(current)} → HTTP '
-            '${response.statusCode} → ${location.trim()}');
+          location.isNotEmpty) {
         current = current.resolve(location);
-        continue;
+        if (current.queryParameters.containsKey('token')) {
+          token = current.queryParameters['token'];
+        }
+        if (current.queryParameters.containsKey('_token')) {
+          token = current.queryParameters['_token'];
+        }
+      } else {
+        break;
       }
+    }
 
-      // 落点：classroom 的 token 响应。JWT 可能在响应体、Set-Cookie，
-      // 或此前跳中下发的 classroom 域 Cookie 里。
-      final token = _extractToken(body, response, jar);
-      if (token != null && token.isNotEmpty) {
-        return token;
-      }
+    if (token == null || token.isEmpty) {
       DiagnosticLogService.instance.record(
         module: 'zhiyun',
-        operation: 'tokenCallback',
+        operation: 'loginFailed',
         requestUri: current,
-        statusCode: response.statusCode,
-        message: '登录落点未含 JWT',
-        error: body.length > 200 ? body.substring(0, 200) : body,
+        message: '链路结束仍未获得 _token',
       );
-      // identity 的 CAS 端点按站点注册表匹配 service：迁移未接入的站点
-      // 一律 400「客户端未找到」（实测 classroom/zdbk 等均未注册，仅
-      // courses 已接入）。这不是客户端可绕过的状态，给用户可读的解释。
-      if (current.host == 'identity.zju.edu.cn' &&
-          response.statusCode == HttpStatus.badRequest) {
-        throw const ZhiyunException(
-            '智云课堂登录暂不可用（学校统一认证迁移中，该站点尚未接入）；'
-            '可先在浏览器打开智云课堂');
-      }
-      throw ZhiyunException(
-          '智云课堂未下发 token（落点 ${current.host}，HTTP ${response.statusCode}）');
+      throw ZhiyunException('智云课堂登录未获得 _token（链路停留在 ${current.host}）');
     }
-    throw ExceptionWithMessage(
-      '智云课堂登录失败：重定向次数过多',
-      details: hopTrace.join('\n'),
-    );
+
+    // 校验 token 并拉取账号信息（失败不阻塞——token 可能仍可用）。
+    await _verifyToken(token);
+    return token;
   }
 
-  static String? _extractToken(
-      String body, HttpClientResponse response, Map<String, Cookie> jar) {
+  static Future<void> _verifyToken(String token) async {
     try {
-      final payload = decodeJsonMap(body, context: '智云 token 回调');
-      final candidates = [
-        payload['token'],
-        asStringMap(payload['data'])?['token'],
-        payload['access_token'],
-        asStringMap(payload['data'])?['access_token'],
-        asStringMap(payload['user'])?['token'],
-      ];
-      for (final candidate in candidates) {
-        final value = asString(candidate)?.trim() ?? '';
-        if (value.isNotEmpty) return value;
+      final infoUri = Uri.parse('$_zhiyunBase/userapi/v1/infosimple');
+      final infoReq = await _client.getUrl(infoUri).timeout(
+            const Duration(seconds: 8),
+            onTimeout: () => throw const ZhiyunException('智云课堂请求超时'),
+          );
+      infoReq.headers.set('Authorization', 'Bearer $token');
+      infoReq.headers.set('Cookie', '_token=$token; token=$token');
+      infoReq.headers.set('User-Agent', _userAgent);
+      final infoResp = await infoReq.close().timeout(
+            const Duration(seconds: 8),
+            onTimeout: () => throw const ZhiyunException('智云课堂请求超时'),
+          );
+      if (infoResp.statusCode == 200) {
+        final body = await _readBodyWithTimeout(infoResp);
+        final json = decodeJsonMap(body, context: '智云用户信息');
+        final params = asStringMap(json['params']);
+        final account = asString(params?['account']);
+        if (account != null && account.isNotEmpty) {
+          _db?.setCachedWebPage(_accountKey, account);
+        }
+        final userId = asString(params?['id']);
+        if (userId != null && userId.isNotEmpty) {
+          _db?.setCachedWebPage(_userIdKey, userId);
+        }
+      } else {
+        await infoResp.drain<void>();
       }
-    } on Object {
-      // 响应不是 JSON：继续尝试 Cookie。
+    } on Object catch (error, stackTrace) {
+      DiagnosticLogService.instance.record(
+        level: CelechronLogLevel.warning,
+        module: 'zhiyun',
+        operation: 'verifyToken',
+        message: '智云 Token 校验失败（不阻塞使用）',
+        error: error,
+        stackTrace: stackTrace,
+      );
     }
-    for (final cookie in response.cookies) {
-      final value = cookie.value.trim();
-      if (value.startsWith('eyJ') && value.length > 40) {
-        return value;
-      }
-    }
-    for (final cookie in jar.values) {
-      if (!cookie.name.contains('token') && cookie.name != '_token') continue;
-      final value = cookie.value.trim();
-      if (value.isNotEmpty && !value.contains(';s:')) return value;
-    }
-    return null;
   }
 
-  static void _reloginZhiyun() {
-    _cachedZhiyunToken = null;
-    _db?.setCachedWebPage(_tokenKey, '');
-  }
-
-  // ===== 基础请求：Bearer + tenant 头 + 401 自愈 =====
+  // ===== 基础请求：Bearer + _token Cookie 头 =====
 
   static Future<String> _readBodyWithTimeout(HttpClientResponse response) {
     return response.transform(utf8.decoder).join().timeout(
@@ -299,91 +297,187 @@ class ZhiyunService {
   }
 
   static Future<Map<String, dynamic>> _authedJson(
-    String method,
-    Uri uri, {
-    String? jsonBody,
-    required String token,
-    required void Function(String) setToken,
-  }) async {
-    for (var attempt = 0; attempt < 2; attempt++) {
-      final request = await _client.openUrl(method, uri).timeout(
-            const Duration(seconds: 10),
-            onTimeout: () => throw const ZhiyunException('智云课堂请求超时'),
-          );
-      request.followRedirects = true;
-      request.headers.set('User-Agent', _userAgent);
-      request.headers.set('Authorization', 'Bearer $token');
-      request.headers.set('x-tenant-code', _tenantCode);
-      if (jsonBody != null) {
-        request.headers.contentType = ContentType.json;
-        request.write(jsonBody);
-      }
-      final response = await request.close().timeout(
-            const Duration(seconds: 10),
-            onTimeout: () => throw const ZhiyunException('智云课堂请求超时'),
-          );
-      final body = await _readBodyWithTimeout(response);
-      if (response.statusCode == HttpStatus.unauthorized && attempt == 0) {
-        // token 失效：自愈后重放。
-        _reloginZhiyun();
-        token = _cachedZhiyunToken ?? '';
-        if (token.isEmpty) {
-          throw const ZhiyunException('智云课堂 token 自愈失败');
-        }
-        continue;
-      }
-      return decodeJsonMap(body, context: '智云课堂接口 $uri');
+      String token, Uri uri) async {
+    final request = await _client.getUrl(uri).timeout(
+          const Duration(seconds: 10),
+          onTimeout: () => throw const ZhiyunException('智云课堂请求超时'),
+        );
+    request.followRedirects = true;
+    request.headers.set('User-Agent', _userAgent);
+    request.headers.set('Authorization', 'Bearer $token');
+    request.headers.set('Cookie', '_token=$token; token=$token');
+    final response = await request.close().timeout(
+          const Duration(seconds: 10),
+          onTimeout: () => throw const ZhiyunException('智云课堂请求超时'),
+        );
+    final body = await _readBodyWithTimeout(response);
+    if (response.statusCode == HttpStatus.unauthorized) {
+      throw const _ZhiyunUnauthorized();
     }
-    throw const ZhiyunException('智云课堂请求失败');
+    return decodeJsonMap(body, context: '智云课堂接口 $uri');
   }
 
-  // ===== 核心数据源（文档·2.2） =====
+  // ===== 数据源（Helechron 同款） =====
 
-  /// 当前用户全部课程（POST /api/course/get-user-courses）。
-  static Future<List<ZhiyunCourse>> _fetchMyCourses(String token) async {
-    final payload = await _authedJson(
-      'POST',
-      Uri.parse(_userCoursesUrl),
-      jsonBody: jsonEncode({'page': 1, 'size': 100, 'keyword': ''}),
-      token: token,
-      setToken: (t) => _cachedZhiyunToken = t,
-    );
-    return _coursesFromPayload(payload);
-  }
-
-  /// 全局搜索课程（POST /api/course/search-courses）。
-  static Future<List<ZhiyunCourse>> _searchCourses(
-      String token, String keyword) async {
-    final payload = await _authedJson(
-      'POST',
-      Uri.parse(_searchUrl),
-      jsonBody: jsonEncode({'keyword': keyword, 'page': 1, 'size': 20}),
-      token: token,
-      setToken: (t) => _cachedZhiyunToken = t,
-    );
-    return _coursesFromPayload(payload);
-  }
-
-  /// 课节目录（GET /api/course/get-course-catalogue?course_id=）。
+  /// 课节目录：优先 v3 get-course-detail 的 sub_list，备用 v2 catalogue。
   static Future<List<ZhiyunSub>> _fetchCatalogue(
       String token, int courseId) async {
-    final uri = Uri.parse(_catalogueUrl)
-        .replace(queryParameters: {'course_id': courseId.toString()});
-    final payload = await _authedJson(
-      'GET',
-      uri,
-      token: token,
-      setToken: (t) => _cachedZhiyunToken = t,
-    );
-    final data = asStringMap(payload['data']) ?? payload;
-    final subs = <ZhiyunSub>[];
-    for (final raw in _iterableOf(data['list'] ?? data['catalogue'])) {
-      final map = asStringMap(raw);
-      if (map == null) continue;
-      final sub = _subFromJson(map);
-      if (sub != null) subs.add(sub);
+    final account = _db?.getCachedWebPage(_accountKey) ?? '';
+    try {
+      final detailUri = Uri.parse(
+              '$_zhiyunBase/courseapi/v3/multi-search/get-course-detail')
+          .replace(queryParameters: {
+        'course_id': courseId.toString(),
+        if (account.isNotEmpty) 'student': account,
+      });
+      final json = await _authedJson(token, detailUri);
+      final ok = json['code'] == 0 ||
+          json['code'] == '0' ||
+          json['success'] == true;
+      if (ok) {
+        final data =
+            asStringMap(json['data']) ?? asStringMap(json['result']);
+        final subListMap = data?['sub_list'];
+        final items = <Map<String, dynamic>>[];
+        if (subListMap is Map) {
+          _extractSubList(subListMap, items);
+        } else if (data?['list'] is List) {
+          for (final item in data!['list'] as List) {
+            final map = asStringMap(item);
+            if (map != null) items.add(map);
+          }
+        }
+        final subs = _subsFromItems(items);
+        if (subs.isNotEmpty) return subs;
+      }
+    } on _ZhiyunUnauthorized {
+      rethrow;
+    } on Object catch (error, stackTrace) {
+      DiagnosticLogService.instance.record(
+        level: CelechronLogLevel.warning,
+        module: 'zhiyun',
+        operation: 'catalogueV3',
+        message: 'v3 课程详情失败，尝试 v2 目录',
+        error: error,
+        stackTrace: stackTrace,
+      );
     }
-    // 按录制时间升序（缺时间靠前），迭代序最后一节即最近一节。
+
+    final catalogueUri =
+        Uri.parse('$_zhiyunBase/courseapi/v2/course/catalogue')
+            .replace(queryParameters: {'course_id': courseId.toString()});
+    final json2 = await _authedJson(token, catalogueUri);
+    final result = asStringMap(json2['result']);
+    final rawData = result?['data'] ?? json2['data'] ?? json2['list'];
+    final items = <Map<String, dynamic>>[];
+    for (final raw in _iterableOf(rawData)) {
+      final map = asStringMap(raw);
+      if (map != null) items.add(map);
+    }
+    return _subsFromItems(items);
+  }
+
+  /// 在线检索课程（pptnote searchlist；教师/无教师两轮降级）。
+  static Future<ZhiyunCourse?> _searchCourse(
+      String token, String courseName, String? teacher) async {
+    final account = _db?.getCachedWebPage(_accountKey) ?? '';
+    final userId = _db?.getCachedWebPage(_userIdKey) ?? '';
+    final cleaned = cleanCourseName(courseName);
+    final coreName = extractCoreCourseName(courseName);
+    final titleCandidates = <String>[cleaned];
+    if (coreName.isNotEmpty && coreName != cleaned) {
+      titleCandidates.add(coreName);
+    }
+
+    // 智云 realname 参数不支持多教师拼接，取第一个。
+    String? singleTeacher;
+    final teacherSet = _teachersOf(teacher);
+    if (teacherSet.isNotEmpty) singleTeacher = teacherSet.first;
+
+    for (final titleKeyword in titleCandidates) {
+      final teacherCandidates = <String?>[
+        if (singleTeacher != null && singleTeacher.isNotEmpty) singleTeacher,
+        null,
+      ];
+      for (final candidateTeacher in teacherCandidates) {
+        final uri = Uri.parse('$_zhiyunBase/pptnote/v1/searchlist')
+            .replace(queryParameters: {
+          'tenant_id': _tenantCode,
+          'user_id': userId,
+          'user_name': account,
+          'page': '1',
+          'per_page': '16',
+          'title': titleKeyword,
+          if (candidateTeacher != null && candidateTeacher.isNotEmpty)
+            'realname': candidateTeacher,
+          'trans': '',
+          'tenant_code': _tenantCode,
+          'randomKey': DateTime.now().millisecondsSinceEpoch.toString(),
+        });
+        final json = await _authedJson(token, uri);
+        final total = asStringMap(json['total']);
+        final list = asDynamicList(total?['list']) ?? const [];
+        for (final item in list) {
+          final map = asStringMap(item);
+          if (map == null) continue;
+          final courseId = _asId(map['course_id'] ?? map['id']);
+          if (courseId == null || courseId <= 0) continue;
+          final title = asString(map['title']) ?? '';
+          final itemTeacher = asString(map['realname']) ?? '';
+          if (!matchesCourseName(courseName, title, teacherSet, itemTeacher)) {
+            continue;
+          }
+          return ZhiyunCourse(
+            courseId: courseId,
+            title: title,
+            realname: itemTeacher,
+          );
+        }
+      }
+    }
+    return null;
+  }
+
+  /// sub_list 是四层嵌套 Map（年 → 月 → 周 → 课节列表）。
+  static void _extractSubList(
+      Map subListMap, List<Map<String, dynamic>> target) {
+    for (final yearVal in subListMap.values) {
+      if (yearVal is Map) {
+        for (final monthVal in yearVal.values) {
+          if (monthVal is Map) {
+            for (final weekVal in monthVal.values) {
+              if (weekVal is List) {
+                for (final sub in weekVal) {
+                  final map = asStringMap(sub);
+                  if (map != null) target.add(map);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /// 课节列表 → ZhiyunSub（按录制时间升序，末位即最近一节）。
+  static List<ZhiyunSub> _subsFromItems(List<Map<String, dynamic>> items) {
+    final subs = <ZhiyunSub>[];
+    for (final map in items) {
+      final subId = _asId(map['sub_id'] ?? map['id']);
+      if (subId == null || subId <= 0) continue;
+      final title =
+          (asString(map['title']) ?? asString(map['sub_title']) ?? '').trim();
+      DateTime? recordedAt;
+      final startAt = int.tryParse(asString(map['start_at']) ?? '');
+      if (startAt != null && startAt > 0) {
+        recordedAt = DateTime.fromMillisecondsSinceEpoch(
+            startAt > 100000000000 ? startAt : startAt * 1000);
+      } else {
+        recordedAt = DateTime.tryParse(asString(map['date']) ?? '') ??
+            DateTime.tryParse(asString(map['video_date']) ?? '');
+      }
+      subs.add(ZhiyunSub(subId: subId, title: title, recordedAt: recordedAt));
+    }
     subs.sort((a, b) {
       final at = a.recordedAt, bt = b.recordedAt;
       if (at != null && bt != null) return at.compareTo(bt);
@@ -394,26 +488,31 @@ class ZhiyunService {
     return subs;
   }
 
-  /// 兼容 PHP 双形态：list 可能在 data.list / data.courses / 顶层。
-  static List<ZhiyunCourse> _coursesFromPayload(Map<String, dynamic> payload) {
-    final data = asStringMap(payload['data']) ?? payload;
-    final raw = data['list'] ?? data['courses'] ?? payload['list'];
-    final courses = <ZhiyunCourse>[];
-    for (final item in _iterableOf(raw)) {
-      final map = asStringMap(item);
-      if (map == null) continue;
-      final course = _courseFromJson(map);
-      if (course != null) courses.add(course);
-    }
-    return courses;
+  /// 多态容器兼容：List 直接用，Map 取 values。
+  static Iterable<Object?> _iterableOf(Object? raw) {
+    if (raw is List) return raw;
+    if (raw is Map) return raw.values;
+    return const [];
+  }
+
+  static int? _asId(Object? value) {
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    return int.tryParse(value?.toString().trim() ?? '');
+  }
+
+  static Set<String> _teachersOf(String? teacher) {
+    if (teacher == null || teacher.trim().isEmpty) return const {};
+    return teacher
+        .split(RegExp(r'[,，/、;；\s+]+'))
+        .map((t) => t.trim())
+        .where((t) => t.isNotEmpty)
+        .toSet();
   }
 
   // ===== 对卡片暴露的解析管线 =====
 
   /// 解析课程 → 智云课节（直达参数）。
-  ///
-  /// [ZhiyunResolve.notMatched]（我的课程与搜索都没有 / 无回放）时卡片
-  /// 隐藏；其余失败以 [ZhiyunResolve.error] 带原因返回，卡片直接展示原因。
   static Future<ZhiyunResolve> resolveCourse({
     required String courseName,
     String? teacher,
@@ -429,16 +528,20 @@ class ZhiyunService {
       final courseId = _asId(map?['course_id']);
       final subId = _asId(map?['sub_id']);
       if (courseId != null && subId != null) {
-        final token = await _getToken(username: username, password: password);
-        final subs = await _fetchCatalogue(token, courseId);
-        final latest = subs.isEmpty ? subId : subs.last.subId;
-        return ZhiyunResolve.ready(
-          courseId: courseId,
-          latestSubId: latest,
-          subCount: subs.length,
-          title: asString(map?['title']) ?? courseName,
-          realname: asString(map?['teacher']) ?? '',
-        );
+        try {
+          final token = await _getToken(username: username, password: password);
+          final subs = await _fetchCatalogue(token, courseId);
+          final latest = subs.isEmpty ? subId : subs.last.subId;
+          return ZhiyunResolve.ready(
+            courseId: courseId,
+            latestSubId: latest,
+            subCount: subs.length,
+            title: asString(map?['title']) ?? courseName,
+            realname: asString(map?['teacher']) ?? '',
+          );
+        } on ZhiyunException catch (error) {
+          return ZhiyunResolve.error(error.message);
+        }
       }
     }
 
@@ -456,45 +559,40 @@ class ZhiyunService {
       }
     }
 
-    // 候选一：我的课程（打分择优，文档·2.3）。
-    final teacherSet = _teachersOf(teacher);
-    var matched =
-        _pickBestByScore(await _fetchMyCourses(token), courseName, teacherSet);
-
-    // 候选二：全局搜索（清洗名 + 核心名多关键词）。
-    if (matched == null) {
-      final keywords = <String>{
-        cleanCourseName(courseName),
-        extractCoreCourseName(courseName),
-      }..removeWhere((k) => k.isEmpty);
-      for (final keyword in keywords) {
-        final found = await _searchCourses(token, keyword);
-        matched = _pickBestByScore(found, courseName, teacherSet);
-        if (matched != null) break;
+    try {
+      return await _resolveWithToken(token, courseName, teacher);
+    } on _ZhiyunUnauthorized {
+      // token 失效：清缓存重登一次后重放。
+      _reloginZhiyun();
+      try {
+        final fresh = await _getToken(username: username, password: password);
+        return await _resolveWithToken(fresh, courseName, teacher);
+      } on ZhiyunException catch (error) {
+        return ZhiyunResolve.error(error.message);
       }
+    } on ZhiyunException catch (error) {
+      return ZhiyunResolve.error(error.message);
     }
+  }
 
+  static Future<ZhiyunResolve> _resolveWithToken(
+      String token, String courseName, String? teacher) async {
+    final matched = await _searchCourse(token, courseName, teacher);
     if (matched == null) {
       DiagnosticLogService.instance.record(
         module: 'zhiyun',
         operation: 'match',
-        message: '我的课程与搜索均未命中「$courseName」',
+        message: '在线检索未命中「$courseName」',
       );
       return const ZhiyunResolve.notMatched();
     }
 
-    // 课节目录：拿到 sub_id 才算可用。
-    List<ZhiyunSub> subs;
-    try {
-      subs = await _fetchCatalogue(token, matched.courseId);
-    } on ZhiyunException catch (error) {
-      return ZhiyunResolve.error('获取回放失败：${error.message}');
-    }
+    final subs = await _fetchCatalogue(token, matched.courseId);
     if (subs.isEmpty) {
       return const ZhiyunResolve.notMatched(); // 没上/没生成回放 → 隐藏
     }
 
-    // 成功：写入显式绑定。
+    final bindingKey = _bindingKey(courseName, teacher);
     final binding = jsonEncode({
       'course_id': matched.courseId,
       'sub_id': subs.last.subId,
@@ -512,117 +610,14 @@ class ZhiyunService {
     );
   }
 
-  /// 直达 URL（文档·2.4 播放间拼接规范，tenant_code 为用户实测补充）。
+  /// 直达 URL（播放间拼接规范）。
   static String livingroomUrl(int courseId, int subId) =>
       'https://classroom.zju.edu.cn/livingroom?course_id=$courseId'
       '&sub_id=$subId&tenant_code=$_tenantCode';
+}
 
-  // ===== 匹配与解析助手 =====
-
-  /// 命中候选打分择优（文档·2.3）：当前学期 +100、教师命中 +50、
-  /// 核心课名全等 +80；先过名称梯队匹配再打分。
-  static ZhiyunCourse? _pickBestByScore(
-      List<ZhiyunCourse> candidates, String courseName, Set<String> teacherSet) {
-    ZhiyunCourse? best;
-    var bestScore = -1;
-    for (final candidate in candidates) {
-      if (!matchesCourseName(
-          courseName, candidate.title, teacherSet, candidate.realname)) {
-        continue;
-      }
-      var score = 0;
-      if (_stripSymbols(extractCoreCourseName(courseName)) ==
-          _stripSymbols(extractCoreCourseName(candidate.title))) {
-        score += 80;
-      }
-      final lecturer = _normalizeName(candidate.realname);
-      if (teacherSet.isNotEmpty &&
-          lecturer.isNotEmpty &&
-          teacherSet.any((t) => lecturer.contains(t) || t.contains(lecturer))) {
-        score += 50;
-      }
-      final termLabel = _currentTermLabel();
-      if (termLabel != null &&
-          candidate.term.isNotEmpty &&
-          candidate.term.contains(termLabel)) {
-        score += 100;
-      }
-      if (score > bestScore) {
-        bestScore = score;
-        best = candidate;
-      }
-    }
-    return best;
-  }
-
-  /// 当前学期标签（秋冬：9-1 月；春夏：2-8 月）。
-  static String? _currentTermLabel() {
-    final now = DateTime.now();
-    final year = now.year;
-    final month = now.month;
-    final startYear = (month >= 2 && month <= 8) || month == 1
-        ? year - 1
-        : year;
-    return month >= 2 && month <= 8
-        ? '$startYear-${startYear + 1}春夏'
-        : '$startYear-${startYear + 1}秋冬';
-  }
-
-  /// 多态容器兼容：List 直接用，Map 取 values。
-  static Iterable<Object?> _iterableOf(Object? raw) {
-    if (raw is List) return raw;
-    if (raw is Map) return raw.values;
-    return const [];
-  }
-
-  /// 宽松字段抽取：course_id/id、name/title、teacher_name/teacher、term。
-  static ZhiyunCourse? _courseFromJson(Map<String, dynamic> map) {
-    final courseId = _asId(map['course_id'] ?? map['id']);
-    if (courseId == null || courseId <= 0) return null;
-    final title =
-        (asString(map['name']) ?? asString(map['title']) ?? '').trim();
-    if (title.isEmpty) return null;
-    final teacher = (asString(map['teacher_name']) ??
-            asString(map['teacher']) ??
-            asString(map['realname']) ??
-            '')
-        .trim();
-    final term = (asString(map['term']) ?? '').trim();
-    return ZhiyunCourse(
-        courseId: courseId, title: title, realname: teacher, term: term);
-  }
-
-  /// 课节字段：sub_id/id、title、video_date/start_time、has_video。
-  static ZhiyunSub? _subFromJson(Map<String, dynamic> map) {
-    final subId = _asId(map['sub_id'] ?? map['id']);
-    if (subId == null || subId <= 0) return null;
-    final hasVideo = map['has_video'];
-    if (hasVideo != null && asBool(hasVideo) != true) return null;
-    final title = (asString(map['title']) ?? '').trim();
-    final recordedAt =
-        DateTime.tryParse(asString(map['video_date']) ?? '') ??
-            DateTime.tryParse(asString(map['start_time']) ?? '');
-    return ZhiyunSub(subId: subId, title: title, recordedAt: recordedAt);
-  }
-
-  static int? _asId(Object? value) {
-    if (value is int) return value;
-    if (value is num) return value.toInt();
-    return int.tryParse(value?.toString().trim() ?? '');
-  }
-
-  /// 教务教师字段拆分：`张三,李四` / `张三/李四` / `张三、李四` 均可。
-  static Set<String> _teachersOf(String? teacher) {
-    if (teacher == null || teacher.trim().isEmpty) return const {};
-    return teacher
-        .split(RegExp(r'[,，/、;；]'))
-        .map((t) => t.replaceAll(RegExp(r'\s+'), '').trim())
-        .where((t) => t.isNotEmpty)
-        .toSet();
-  }
-
-  static String _normalizeName(String input) =>
-      input.replaceAll(RegExp(r'\s+'), '').trim();
+class _ZhiyunUnauthorized implements Exception {
+  const _ZhiyunUnauthorized();
 }
 
 /// 智云侧业务异常（文案直接面向用户展示）。
@@ -678,18 +673,16 @@ class ZhiyunResolve {
 
 enum ZhiyunResolveKind { ready, notMatched, error }
 
-/// 「我的课程」/搜索里的一条候选课程。
+/// 在线检索里的一条候选课程。
 class ZhiyunCourse {
   final int courseId;
   final String title;
   final String realname;
-  final String term;
 
   const ZhiyunCourse({
     required this.courseId,
     required this.title,
     required this.realname,
-    this.term = '',
   });
 }
 
@@ -706,7 +699,7 @@ class ZhiyunSub {
   });
 }
 
-// ===== 课程名称清洗与梯队匹配（文档·2.3） =====
+// ===== 课程名称清洗与梯队匹配（Helechron 同款） =====
 
 /// 基础清洗：规整括号、剥末尾班级号与 -数字 后缀。
 String cleanCourseName(String courseName) {
@@ -762,11 +755,6 @@ String? _collegeEnglishLevel(String name) {
 }
 
 /// 梯队式渐进模糊匹配。
-///
-/// Tier 1 冲突防御：等级（甲/乙）或罗马数字（I-V）两边都有且不一致 →
-/// 直接 false，防止《大学物理(甲)I》串到(乙)II；Tier 2 归一化全等；
-/// Tier 3 核心课名相等；Tier 4 特殊学科（大学英语分级同级）；Tier 5
-/// 宽松子串包含（核心词 ≥3，教师交叉命中时放宽）。
 bool matchesCourseName(
     String localName, String remoteName, Set<String> teacherSet,
     [String remoteTeacher = '']) {
@@ -812,6 +800,6 @@ bool matchesCourseName(
   return false;
 }
 
-/// 荣誉课程（H）标记识别（文档·2.3 防串课预留）。
+/// 荣誉课程（H）标记识别（防串课预留）。
 bool isHonorsCourse(String name) =>
     RegExp(r'[([]\s*(?:H|荣誉)\s*[)\]]', caseSensitive: false).hasMatch(name);
