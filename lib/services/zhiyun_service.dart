@@ -194,11 +194,15 @@ class ZhiyunService {
       // 卡在 zjuam CAS 登录表单（OAuth authorize 把未持对应会话的请求踢到
       // 表单；CAS 不签发 CASTGC、authorize 也不认 iPlanet）。处理取两轮
       // 实测之长：用 1.3.5.18 验证过的「全新流程一次性密码提交」（它能拿
-      // 到票），但 service 用 1.3.5.19 的逐字节原样串——从表单 URL 的
-      // query 里直接截取，不解码不再编码（CAS 的票据校验按 service 串逐
-      // 字节比对，重编码会让票被拒）。OAuth 的待处理请求就在 service 串
-      // 里（client_id/redirect_uri），不依赖会话，全新流程无碍。最多 2 次，
-      // 防表单环。
+      // 到票），service 用 1.3.5.19 的逐字节原样串——从表单 URL 的 query
+      // 里直接截取，不解码不再编码。
+      //
+      // 关键：重认证返回的新会话 Cookie **不并入罐**——authorize 把待处理
+      // 的 OAuth 请求（redirect_uri 等）存在它那次的 JSESSIONID 会话里，
+      // callbackAuthorize 必须带原会话才能取回；1.3.5.18/1.3.5.20 把新会
+      // 话并入罐后，callbackAuthorize 拿新会话找不到待处理请求，直接踢回
+      // 裸登录页（无 service，日志实测）。票据本身存在票据登记中心，不依
+      // 赖会话，重认证流程自含。最多 2 次，防表单环。
       if (reauthCount < 2 &&
           response.statusCode == HttpStatus.ok &&
           currentUrl.host == 'zjuam.zju.edu.cn' &&
@@ -217,14 +221,14 @@ class ZhiyunService {
           operation: 'ssoReauth',
           requestUri: currentUrl,
           message: '在 CAS 登录表单重新提交密码（第 $reauthCount 次，'
-              '原样 service 长度 ${rawService?.length ?? 0}）',
+              '原样 service 长度 ${rawService?.length ?? 0}，'
+              '不并罐保留原会话）',
         );
         if (rawService != null && rawService.isNotEmpty) {
           try {
-            final (reauthCookies, reauthTarget) = await _loginForZhiyunTicket(
+            final (_, reauthTarget) = await _loginForZhiyunTicket(
                 username, password,
                 rawServiceQuery: rawService);
-            _seedSessionCookies(jar, reauthCookies);
             currentUrl = reauthTarget;
             continue;
           } on Exception catch (error) {
