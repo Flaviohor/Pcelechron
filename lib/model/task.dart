@@ -8,7 +8,8 @@ import 'package:quiver/time.dart';
 enum TaskType {
   deadline, // 只有结束时间固定的《真DDL》
   fixed, // 开始和结束时间都固定的《日程》
-  fixedlegacy // 已过的《日程》
+  fixedlegacy, // 已过的《日程》
+  homework // 学在浙大同步的作业（只能由接口同步生成，不可手动伪造）
 }
 
 enum TaskStatus { running, suspended, completed, failed, deleted, outdated }
@@ -19,6 +20,7 @@ const Map<TaskType, String> deadlineTypeName = {
   TaskType.deadline: 'DDL',
   TaskType.fixed: '日程',
   TaskType.fixedlegacy: '过去日程',
+  TaskType.homework: '作业',
 };
 
 const Map<TaskStatus, String> deadlineStatusName = {
@@ -100,6 +102,11 @@ class Task {
   String? fromUid;
   @HiveField(16)
   String? courseId;
+
+  /// homework 类型在状态机与展示上与 deadline 同语义（过期判定、进度、
+  /// 标记完成等）；判断类型分支时用它代替直接比较 deadline。
+  bool get behavesAsDeadline =>
+      type == TaskType.deadline || type == TaskType.homework;
 
   Task({
     this.uid = '114514',
@@ -230,7 +237,7 @@ class Task {
         progress = (DateTime.now().difference(startTime).inSeconds) /
             (endTime.difference(startTime).inSeconds);
       }
-    } else if (type == TaskType.deadline) {
+    } else if (behavesAsDeadline) {
       progress = timeSpent.inSeconds / timeNeeded.inSeconds;
     }
     if (progress > 1) {
@@ -243,7 +250,7 @@ class Task {
   }
 
   void updateTimeSpent(Duration length) {
-    if (type != TaskType.deadline) {
+    if (!behavesAsDeadline) {
       return;
     }
     timeSpent = length;
@@ -254,7 +261,7 @@ class Task {
   }
 
   void refreshStatus() {
-    if (type == TaskType.deadline) {
+    if (behavesAsDeadline) {
       if (timeSpent >= timeNeeded) {
         status = TaskStatus.completed;
       } else if (status != TaskStatus.completed &&
@@ -271,7 +278,7 @@ class Task {
   }
 
   void forceRefreshStatus() {
-    if (type == TaskType.deadline) {
+    if (behavesAsDeadline) {
       if (timeSpent >= timeNeeded) {
         status = TaskStatus.completed;
       } else if (status != TaskStatus.completed &&

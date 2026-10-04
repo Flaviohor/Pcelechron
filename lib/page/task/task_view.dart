@@ -11,6 +11,7 @@ import 'package:celechron/model/task.dart';
 import 'package:celechron/model/period.dart';
 import 'package:celechron/utils/platform_features.dart';
 import 'package:celechron/design/glass_route.dart';
+import 'package:url_launcher/url_launcher_string.dart';
 import 'task_edit_page.dart';
 import 'dart:async';
 import 'package:get/get.dart';
@@ -31,7 +32,7 @@ class TaskPage extends StatelessWidget {
       builder: (BuildContext context) {
         return CupertinoAlertDialog(
           title: Text(
-            '${deadline.summary}：${deadline.type == TaskType.deadline ? deadlineStatusName[deadline.status]! : deadline.type == TaskType.fixed ? deadlineTypeName[TaskType.fixed] : ''}',
+            '${deadline.summary}：${deadline.behavesAsDeadline ? deadlineStatusName[deadline.status]! : deadlineTypeName[TaskType.fixed]!}',
             style: const TextStyle(fontWeight: FontWeight.bold),
           ),
           content: SizedBox(
@@ -49,7 +50,7 @@ class TaskPage extends StatelessWidget {
                       '结束于 ${toStringHumanReadable(deadline.endTime)}',
                     ),
                   ],
-                  if (deadline.type == TaskType.deadline) ...[
+                  if (deadline.behavesAsDeadline) ...[
                     Text(
                       '截止于 ${toStringHumanReadable(deadline.endTime)}${deadline.endTime.isBefore(DateTime.now()) ? ' - 已过期' : ''}',
                     ),
@@ -76,7 +77,7 @@ class TaskPage extends StatelessWidget {
               onPressed: () => Navigator.of(context).pop(),
               child: const Text('返回'),
             ),
-            if (deadline.type == TaskType.deadline &&
+            if (deadline.behavesAsDeadline &&
                 deadline.timeSpent < deadline.timeNeeded)
               CupertinoDialogAction(
                 onPressed: () {
@@ -92,7 +93,7 @@ class TaskPage extends StatelessWidget {
                 child: Text(
                     '标记为${deadline.status == TaskStatus.completed ? '未' : ''}完成'),
               ),
-            if (deadline.type == TaskType.deadline &&
+            if (deadline.behavesAsDeadline &&
                 (deadline.status == TaskStatus.running ||
                     deadline.status == TaskStatus.suspended))
               CupertinoDialogAction(
@@ -109,7 +110,7 @@ class TaskPage extends StatelessWidget {
                 child:
                     Text(deadline.status == TaskStatus.running ? '暂停' : '继续'),
               ),
-            if (deadline.type == TaskType.deadline ||
+            if (deadline.behavesAsDeadline ||
                 deadline.type == TaskType.fixed)
               CupertinoDialogAction(
                 onPressed: () async {
@@ -202,7 +203,7 @@ class TaskPage extends StatelessWidget {
             : SubtitleRow(subtitle: title),
         Dismissible(
           key: Key(deadline.uid),
-          direction: deadline.type == TaskType.deadline
+          direction: deadline.behavesAsDeadline
               ? DismissDirection.horizontal
               : DismissDirection.endToStart,
           movementDuration: const Duration(milliseconds: 300),
@@ -212,7 +213,7 @@ class TaskPage extends StatelessWidget {
             DismissDirection.endToStart: 0.25,
           },
           crossAxisEndOffset: 0.0,
-          background: deadline.type == TaskType.deadline
+          background: deadline.behavesAsDeadline
               ? Container(
                   alignment: Alignment.centerLeft,
                   padding: const EdgeInsets.only(left: 16),
@@ -263,7 +264,7 @@ class TaskPage extends StatelessWidget {
           confirmDismiss: (direction) async {
             if (direction == DismissDirection.startToEnd) {
               // 向右滑（从左到右）：完成 - 不真正 dismiss，只更新状态
-              if (deadline.type == TaskType.deadline) {
+              if (deadline.behavesAsDeadline) {
                 if (deadline.status == TaskStatus.completed) {
                   // 如果已完成，恢复为未完成状态，并重置计时
                   deadline.timeSpent = const Duration(minutes: 0);
@@ -354,7 +355,7 @@ class TaskPage extends StatelessWidget {
                       Obx(() {
                         final now = _flowController.timeNow.value;
                         return Text(
-                            deadline.type == TaskType.deadline
+                            deadline.behavesAsDeadline
                                 ? deadlineStatusName[deadline.status]!
                                 : (now.isBefore(deadline.startTime)
                                     ? '未开始'
@@ -403,6 +404,61 @@ class TaskPage extends StatelessWidget {
                       ),
                     ],
                   ),
+                  if (deadline.type == TaskType.homework) ...[
+                    Row(
+                      children: [
+                        Icon(
+                          CupertinoIcons.doc_text,
+                          size: 14,
+                          color: CupertinoTheme.of(context)
+                              .textTheme
+                              .textStyle
+                              .color!
+                              .withValues(alpha: 0.5),
+                        ),
+                        Expanded(
+                          child: Text(
+                            ' 来源：学在浙大',
+                            style: TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.normal,
+                              color: CupertinoTheme.of(context)
+                                  .textTheme
+                                  .textStyle
+                                  .color!
+                                  .withValues(alpha: 0.75),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ),
+                        CupertinoButton(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 2),
+                          minimumSize: const Size(0, 0),
+                          color: CupertinoColors.activeBlue,
+                          borderRadius: BorderRadius.circular(12),
+                          onPressed: () {
+                            final submitUrl = RegExp(r'提交：(https://\S+)')
+                                .firstMatch(deadline.description)
+                                ?.group(1);
+                            if (submitUrl != null) {
+                              launchUrlString(submitUrl,
+                                  mode: LaunchMode.externalApplication);
+                            }
+                          },
+                          child: const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(CupertinoIcons.paperplane_fill,
+                                  size: 12),
+                              SizedBox(width: 4),
+                              Text('去提交', style: TextStyle(fontSize: 12)),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                   if (deadline.type == TaskType.fixed) ...[
                     Row(
                       children: [
@@ -458,7 +514,7 @@ class TaskPage extends StatelessWidget {
                               )))
                     ]),
                   ],
-                  if (deadline.type == TaskType.deadline)
+                  if (deadline.behavesAsDeadline)
                     Row(children: [
                       Icon(
                         CupertinoIcons.play_fill,
@@ -496,7 +552,7 @@ class TaskPage extends StatelessWidget {
                       );
                     }),
                   ],
-                  if (deadline.type == TaskType.deadline &&
+                  if (deadline.behavesAsDeadline &&
                       deadline.status == TaskStatus.suspended) ...[
                     const SizedBox(height: 8.0),
                     LinearProgressIndicator(
@@ -506,7 +562,7 @@ class TaskPage extends StatelessWidget {
                       valueColor: AlwaysStoppedAnimation<Color>(color),
                     ),
                   ],
-                  if (deadline.type == TaskType.deadline &&
+                  if (deadline.behavesAsDeadline &&
                       deadline.status == TaskStatus.completed) ...[
                     const SizedBox(height: 8.0),
                     LinearProgressIndicator(
@@ -516,7 +572,7 @@ class TaskPage extends StatelessWidget {
                       valueColor: AlwaysStoppedAnimation<Color>(color),
                     ),
                   ],
-                  if (deadline.type == TaskType.deadline &&
+                  if (deadline.behavesAsDeadline &&
                       deadline.status == TaskStatus.failed) ...[
                     const SizedBox(height: 8.0),
                     LinearProgressIndicator(

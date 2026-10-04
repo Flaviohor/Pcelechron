@@ -8,6 +8,7 @@ import 'package:celechron/page/option/option_controller.dart';
 import 'package:celechron/services/ddl_schedule_service.dart';
 import 'package:celechron/services/diagnostic_log_service.dart';
 import 'package:celechron/services/refresh_coordinator.dart';
+import 'package:celechron/services/todo_task_sync.dart';
 import 'package:celechron/utils/json_utils.dart';
 import 'package:celechron/model/practice_score_item.dart';
 
@@ -519,6 +520,8 @@ class Scholar {
     // 全新用户（原本就没有作业）不受影响。
     if (errorResult[3] == false && (tempTodos.isNotEmpty || todos.isEmpty)) {
       todos = tempTodos;
+      // 作业同步进任务列表（幂等，按 fromUid 去重，截止时间变更自动更新）。
+      TodoTaskSync.sync(todos);
     } else if (errorResult[3] == false && tempTodos.isEmpty) {
       DiagnosticLogService.instance.record(
         level: CelechronLogLevel.warning,

@@ -598,7 +598,24 @@ class _ClassroomSectionState extends State<_ClassroomSection> {
       _phase = _ZhiyunPhase.checking;
       _detail = '';
     });
+    // 显示时机控制（文档·2.5）：整门课的所有节次都尚未开课时不展示
+    // 卡片——未来课程没有录播，显示空白卡片只会引发误解与无谓请求。
+    // 课表节次（scholar.periods）经 session.id 与本课程关联。
     final scholar = Get.find<Rx<Scholar>>(tag: 'scholar').value;
+    final now = DateTime.now();
+    final sessionIds = widget.course.sessions
+        .map((session) => session.id)
+        .whereType<String>()
+        .toSet();
+    final coursePeriods = scholar.periods
+        .where((period) =>
+            period.fromUid != null && sessionIds.contains(period.fromUid))
+        .toList();
+    if (coursePeriods.isNotEmpty &&
+        coursePeriods.every((period) => now.isBefore(period.startTime))) {
+      _finish(_ZhiyunPhase.hidden, '');
+      return;
+    }
     if (!scholar.isLogan) {
       _finish(_ZhiyunPhase.error, '未登录，登录后即可关联智云课堂回放');
       return;

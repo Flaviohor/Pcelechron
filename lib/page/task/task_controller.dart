@@ -10,15 +10,16 @@ class TaskController extends GetxController {
   Timer? _timer;
 
   List<Task> get todoDeadlineList => taskList
-      .where((element) => (element.type == TaskType.deadline &&
+      .where((element) => (element.behavesAsDeadline &&
           (element.status == TaskStatus.running ||
               element.status == TaskStatus.suspended ||
               element.status == TaskStatus.failed)))
       .toList();
 
   List<Task> get doneDeadlineList => taskList
-      .where((element) => (element.type == TaskType.deadline &&
-          element.status == TaskStatus.completed))
+      .where((element) =>
+          (element.behavesAsDeadline &&
+              element.status == TaskStatus.completed))
       .toList();
 
   List<Task> get fixedDeadlineList =>
@@ -70,7 +71,7 @@ class TaskController extends GetxController {
       final oldStatus = deadline.status;
       final oldEndTime = deadline.endTime;
       deadline.refreshStatus();
-      if (deadline.type == TaskType.deadline) {
+      if (deadline.behavesAsDeadline) {
         if (deadline.timeSpent >= deadline.timeNeeded) {
           deadline.status = TaskStatus.completed;
         } else if (deadline.status != TaskStatus.completed &&
@@ -137,14 +138,14 @@ class TaskController extends GetxController {
 
   void removeCompletedDeadline(context) {
     taskList.removeWhere((element) =>
-        element.type == TaskType.deadline &&
+        element.behavesAsDeadline &&
         element.status == TaskStatus.completed);
     saveDeadlineListToDb();
   }
 
   void removeFailedDeadline(context) {
     taskList.removeWhere((element) =>
-        element.type == TaskType.deadline &&
+        element.behavesAsDeadline &&
         element.status == TaskStatus.failed);
     saveDeadlineListToDb();
   }
@@ -152,7 +153,7 @@ class TaskController extends GetxController {
   int suspendAllDeadline(context) {
     int count = 0;
     for (var x in taskList) {
-      if (x.type == TaskType.deadline && x.status == TaskStatus.running) {
+      if (x.behavesAsDeadline && x.status == TaskStatus.running) {
         x.status = TaskStatus.suspended;
         count++;
       }
@@ -163,7 +164,7 @@ class TaskController extends GetxController {
   int continueAllDeadline(context) {
     int count = 0;
     for (var x in taskList) {
-      if (x.type == TaskType.deadline && x.status == TaskStatus.suspended) {
+      if (x.behavesAsDeadline && x.status == TaskStatus.suspended) {
         x.status = TaskStatus.running;
         count++;
       }

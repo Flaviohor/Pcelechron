@@ -217,7 +217,11 @@ class _TaskEditPageState extends State<TaskEditPage> {
                     bottom: 8.0,
                   ),
                   child: CupertinoSlidingSegmentedControl<TaskType>(
-                    groupValue: now.type,
+                    // homework 是接口同步的专属类型（不可手动伪造）：编辑
+                    // 页沿用 DDL 语义展示，用户不切换类型时保持 homework。
+                    groupValue: now.behavesAsDeadline
+                        ? TaskType.deadline
+                        : now.type,
                     children: <TaskType, Widget>{
                       TaskType.deadline: Padding(
                         padding: const EdgeInsets.symmetric(horizontal: 20),
@@ -295,7 +299,7 @@ class _TaskEditPageState extends State<TaskEditPage> {
                       textAlign: TextAlign.left,
                       controller: TextEditingController(
                           text:
-                              '${now.type == TaskType.deadline ? '截止于' : '结束于'} ${TimeHelper.chineseDateTime(now.endTime)}'),
+                              '${now.behavesAsDeadline ? '截止于' : '结束于'} ${TimeHelper.chineseDateTime(now.endTime)}'),
                       readOnly: true,
                       onTap: () async {
                         await showCupertinoModalPopup(
@@ -332,7 +336,7 @@ class _TaskEditPageState extends State<TaskEditPage> {
                     ),
                   ],
                 ),
-                if (now.type == TaskType.deadline)
+                if (now.behavesAsDeadline)
                   CupertinoListSection.insetGrouped(
                     header: const Text('时间安排'),
                     children: [
