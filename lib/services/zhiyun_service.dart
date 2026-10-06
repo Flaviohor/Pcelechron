@@ -121,6 +121,11 @@ class ZhiyunService {
               : cookie.domain!)
           .toLowerCase()
           .replaceFirst(RegExp(r'^\.'), '');
+      // 归一化结果必须写回 cookie.domain：否则 domain 保持 null，
+      // 表单提交按域过滤时匹配不到（POST 不带 JSESSIONID → CAS 302
+      // 回踢，1.3.5.26/27 两版的根因），cookiesFor 也会把无域 Cookie
+      // 发给所有主机。
+      cookie.domain = domain;
       cookie.path = '/';
       cookieJar['${cookie.name}|$domain'] = cookie;
     }
