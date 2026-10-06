@@ -140,9 +140,15 @@ class ZhiyunService {
       ..path = '/';
     storeCookie(trustedSso, Uri.parse('https://zjuam.zju.edu.cn/'));
 
+    // 兜底（浏览器同款）：链路与 Helechron 一致，但若中途踢到 zjuam CAS
+    // 登录表单（authorize 拿不到 TGT 会话时会发生，getSsoCookie 的
+    // JSESSIONID 在 ZjuAm 内部被丢弃），就就着当前表单、当前会话提交
+    // 密码——Cookie 只带 zjuam 精确域的（JSESSIONID/_csrf），排除父域
+    // iPlanet（1.3.5.19 实测带上 iPlanet 提交会被 CAS 以 200 拒绝）。
     var current = Uri.parse(_ssoEntryUrl);
     final stopwatch = Stopwatch()..start();
     String? token;
+    var formSubmits = 0;
 
     for (var hop = 0; hop < 12; hop++) {
       if (stopwatch.elapsed > const Duration(seconds: 45)) {
@@ -205,6 +211,7 @@ class ZhiyunService {
       }
 
       final location = response.headers.value(HttpHeaders.locationHeader);
+      final body = await _readBodyWithTimeout(response);
       DiagnosticLogService.instance.record(
         module: 'zhiyun',
         operation: 'loginHop',
@@ -214,7 +221,6 @@ class ZhiyunService {
         message: '登录第${hop + 1}跳'
             '${token != null ? '（已获得 _token）' : ''}',
       );
-      await _readBodyWithTimeout(response);
 
       if (isHttpRedirectStatus(response.statusCode) &&
           location != null &&
@@ -226,9 +232,93 @@ class ZhiyunService {
         if (current.queryParameters.containsKey('_token')) {
           token = current.queryParameters['_token'];
         }
-      } else {
-        break;
+        continue;
       }
+
+      // 落在 zjuam CAS 登录表单（200 + execution）：authorize 找不到 TGT
+      // 会话时踢到这里——浏览器同款动作是「就着当前表单、当前会话提交
+      // 密码」。Cookie 只带 zjuam 精确域（该会话的 JSESSIONID/_csrf），
+      // 排除父域 iPlanet：1.3.5.19 实测带上 iPlanet 的提交被 CAS 以 200
+      // 拒（iPlanet 触发了不同的服务端路径）。302 后把响应的会话 Cookie
+      // 并入罐——这条 JSESSIONID 就是 authorize 等待的 TGT 会话。
+      if (formSubmits < 2 &&
+          response.statusCode == HttpStatus.ok &&
+          current.host == 'zjuam.zju.edu.cn' &&
+          current.path.startsWith('/cas/login') &&
+          body.contains('name="execution"')) {
+        formSubmits++;
+        final execution = RegExp(r'name="execution" value="(.*?)"')
+            .firstMatch(body)
+            ?.group(1);
+        DiagnosticLogService.instance.record(
+          module: 'zhiyun',
+          operation: 'loginFormSubmit',
+          requestUri: current,
+          message: '在 CAS 登录表单提交密码（第 $formSubmits 次，'
+              'execution=${execution != null ? '有' : '缺'}）',
+        );
+        if (execution != null) {
+          try {
+            final pwdEnc = await _encryptZjuamPassword(password);
+            final formRequest = await _client.postUrl(current).timeout(
+                  const Duration(seconds: 10),
+                  onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
+                );
+            formRequest.followRedirects = false;
+            formRequest.headers.set('User-Agent', _userAgent);
+            formRequest.headers.contentType = ContentType(
+                'application', 'x-www-form-urlencoded', charset: 'utf-8');
+            for (final cookie in cookieJar.values) {
+              if (cookie.domain == 'zjuam.zju.edu.cn') {
+                formRequest.cookies.add(cookie);
+              }
+            }
+            formRequest.add(utf8.encode(Uri(queryParameters: {
+              'username': username,
+              'password': pwdEnc,
+              'execution': execution,
+              '_eventId': 'submit',
+              'rememberMe': 'true',
+            }).query));
+            final formResponse = await formRequest.close().timeout(
+                  const Duration(seconds: 10),
+                  onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
+                );
+            for (final cookie in formResponse.cookies) {
+              storeCookie(cookie, current);
+            }
+            final formLocation =
+                formResponse.headers.value(HttpHeaders.locationHeader);
+            await _readBodyWithTimeout(formResponse);
+            DiagnosticLogService.instance.record(
+              module: 'zhiyun',
+              operation: 'loginFormSubmit',
+              requestUri: current,
+              statusCode: formResponse.statusCode,
+              location: formLocation,
+              message: '表单提交响应（第 $formSubmits 次）',
+            );
+            if (isHttpRedirectStatus(formResponse.statusCode) &&
+                formLocation != null &&
+                formLocation.isNotEmpty) {
+              current = current.resolve(formLocation);
+              if (current.queryParameters.containsKey('token')) {
+                token = current.queryParameters['token'];
+              }
+              if (current.queryParameters.containsKey('_token')) {
+                token = current.queryParameters['_token'];
+              }
+              continue;
+            }
+            // 200/其它：密码被拒或表单重出——回到循环顶部重新 GET 当前
+            // URL 再试一次（formSubmits 已限 2 次）。
+            continue;
+          } on ZhiyunException {
+            // 加密/提交失败：落回正常流程，由 loginFailed 带停留点。
+          }
+        }
+      }
+      break;
     }
 
     if (token == null || token.isEmpty) {
@@ -294,6 +384,37 @@ class ZhiyunService {
           const Duration(seconds: 10),
           onTimeout: () => throw const ZhiyunException('智云课堂响应读取超时'),
         );
+  }
+
+  /// 取统一认证 RSA 公钥并加密密码（浏览器同款），返回 128 位十六进制
+  /// 密文。公钥接口无会话依赖，表单重认证与带 service 登录共用。
+  static Future<String> _encryptZjuamPassword(String password) async {
+    final request = await _client
+        .getUrl(Uri.parse('https://zjuam.zju.edu.cn/cas/v2/getPubKey'))
+        .timeout(const Duration(seconds: 8),
+            onTimeout: () => throw const ZhiyunException('统一认证请求超时'));
+    request.followRedirects = false;
+    final response = await request.close().timeout(const Duration(seconds: 8),
+        onTimeout: () => throw const ZhiyunException('统一认证请求超时'));
+    final body = await _readBodyWithTimeout(response);
+    final publicKey = decodeJsonMap(
+        body, context: '统一认证 RSA 公钥；HTTP ${response.statusCode}');
+    final modulusStr = asString(publicKey['modulus']);
+    final exponentStr = asString(publicKey['exponent']);
+    if (modulusStr == null || exponentStr == null) {
+      throw ZhiyunException(
+          '统一认证 RSA 公钥字段缺失；响应摘要：${responseSummary(body)}');
+    }
+    try {
+      final modInt = BigInt.parse(modulusStr, radix: 16);
+      final expInt = BigInt.parse(exponentStr, radix: 16);
+      final pwdInt = BigInt.parse(
+          utf8.encode(password).map((e) => e.toRadixString(16)).join(),
+          radix: 16);
+      return pwdInt.modPow(expInt, modInt).toRadixString(16).padLeft(128, '0');
+    } on Object {
+      throw const ZhiyunException('统一认证：密码加密失败');
+    }
   }
 
   static Future<Map<String, dynamic>> _authedJson(
