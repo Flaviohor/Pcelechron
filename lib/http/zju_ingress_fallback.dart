@@ -10,9 +10,13 @@ import 'dart:io';
 /// 的 Tengine）按 SNI/Host 服务，其通配证书 `*.zju.edu.cn` 覆盖一层子域。
 ///
 /// 通过 [HttpOverrides] 给进程内所有 [HttpClient] 挂 connectionFactory：
-/// 清单内主机改连 ingress 地址；TLS 的 SNI 与证书校验仍按原域名进行
-/// （[SecureSocket.secure] 的 host 参数），安全强度与直连一致。ingress
-/// 不可用时整体退回与原版完全相同的直连路径。
+/// 清单内主机**先直连真实地址**（校内网或线路恢复时秒通，与浏览器同
+/// 路径），直连失败（校外线路黑洞）再改连 ingress 地址；两条路的 TLS
+/// SNI 与证书校验始终按原域名进行，安全强度与直连一致。
+///
+/// 1.3.5.22 教训：无条件钉扎（不做直连探测）在校内网把可达的
+/// zdbk/classroom 强行绕到对本网段不可达的 ingress 路径上，导致校内
+/// 用户登录超时——因此必须直连优先。
 ///
 /// 注意：设置了 connectionFactory 后，https 的 TLS 握手由本工厂负责
 /// （SDK 不再自动包装），因此这里对 https 显式 [SecureSocket.secure]。
@@ -32,8 +36,9 @@ class ZjuIngressFallback extends HttpOverrides {
     'tgmedia.cmc.zju.edu.cn',
   };
 
-  /// 钉扎路径各阶段上限。正常 ~0.5s 内完成；超时即退回直连，
-  /// 保证最坏情况仍与旧版行为一致。
+  /// 钉扎与直连探测各阶段上限。校内直连 <0.5s；校外黑洞直连挂起 3s 到
+  /// 时后转钉扎（~0.5s）；最坏情况 ~3.5s，仍远低于旧版直连超时。
+  static const Duration _directProbeTimeout = Duration(seconds: 3);
   static const Duration _pinTcpTimeout = Duration(seconds: 4);
   static const Duration _pinTlsTimeout = Duration(seconds: 8);
 
@@ -81,7 +86,29 @@ class ZjuIngressFallback extends HttpOverrides {
           : Socket.startConnect(uri.host, port);
     }
 
-    // 钉扎主机：TCP 连 ingress，TLS 按原域名握手。
+    // 钉扎主机：**直连优先**——先连真实地址（校内网/线路恢复时秒通，
+    // 与浏览器同路径），直连失败（校外线路黑洞，TLS 挂起）再改连
+    // ingress。两条路的 TLS 都按原域名握手与校验。1.3.5.22 教训：无条件
+    // 钉扎在校内网把可达的 zdbk/classroom 强行绕到对本网段不可达的
+    // ingress 路径上，导致校内用户登录超时。
+    Future<ConnectionTask<Socket>> startDirect() => isSecure
+        ? SecureSocket.startConnect(uri.host, port,
+            context: context, onBadCertificate: onBadCertificate)
+        : Socket.startConnect(uri.host, port);
+
+    // 1) 直连真实地址（限时探测；校内 <0.5s，校外黑洞挂起到时）。
+    {
+      final direct = await startDirect();
+      try {
+        final socket = await direct.socket.timeout(_directProbeTimeout);
+        return ConnectionTask.fromSocket(
+            Future<Socket>.value(socket), () => socket.destroy());
+      } on Object {
+        direct.cancel();
+      }
+    }
+
+    // 2) ingress 钉扎（校外黑洞场景的备用路径）。
     final pinned = await Socket.startConnect(ingressHost, port);
     Socket? raw;
     try {
@@ -102,13 +129,10 @@ class ZjuIngressFallback extends HttpOverrides {
       pinned.cancel();
       raw?.destroy();
     }
-    // ingress 不可用：退回直连（与未挂 override 之前完全一致）。
-    return isSecure
-        ? SecureSocket.startConnect(uri.host, port,
-            context: context, onBadCertificate: onBadCertificate)
-        : Socket.startConnect(uri.host, port);
+    // 3) 直连与钉扎都失败：退回直连（与未挂 override 之前完全一致），
+    //    错误原样抛给上层。
+    return await startDirect();
   }
-
   /// ingress 为 tgmedia 出示的是 `*.zju.edu.cn` 通配证书（SAN 只覆盖一层
   /// 子域）。仅当证书主题确为浙大通配证书、且由公共 CA（TrustAsia）签发
   /// 时放行——自签名伪证书无法同时满足这两点。
