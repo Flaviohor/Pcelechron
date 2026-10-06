@@ -237,30 +237,46 @@ class ZhiyunService {
 
       // 落在 zjuam CAS 登录表单（200 + execution）：authorize 找不到 TGT
       // 会话时踢到这里——浏览器同款动作是「就着当前表单、当前会话提交
-      // 密码」。Cookie 只带 zjuam 精确域（该会话的 JSESSIONID/_csrf），
-      // 排除父域 iPlanet：1.3.5.19 实测带上 iPlanet 的提交被 CAS 以 200
-      // 拒（iPlanet 触发了不同的服务端路径）。302 后把响应的会话 Cookie
-      // 并入罐——这条 JSESSIONID 就是 authorize 等待的 TGT 会话。
+      // 密码」。两个关键细节（1.3.5.26 教训，POST 被 302 回表单）：
+      // 1) POST 到表单 action（/cas/login 纯路径，**不带 query**）——
+      //    service 由服务端会话（execution）保管，带上 ?service= 反而
+      //    会被 CAS 以 302 回踢；
+      // 2) 提交表单里**全部**隐藏字段（execution/_eventId/ys 等），不是
+      //    只发 execution——漏掉 ys 等字段同样被拒。
+      // Cookie 只带 zjuam 精确域（该会话的 JSESSIONID/_csrf），排除父域
+      // iPlanet（1.3.5.19 实测带上会被 CAS 拒）。
       if (formSubmits < 2 &&
           response.statusCode == HttpStatus.ok &&
           current.host == 'zjuam.zju.edu.cn' &&
           current.path.startsWith('/cas/login') &&
           body.contains('name="execution"')) {
         formSubmits++;
-        final execution = RegExp(r'name="execution" value="(.*?)"')
-            .firstMatch(body)
-            ?.group(1);
+        // 提取表单全部隐藏字段（浏览器同款提交）。
+        final hiddenFields = <String, String>{};
+        for (final tagMatch
+            in RegExp(r'<input[^>]*type="hidden"[^>]*>').allMatches(body)) {
+          final tag = tagMatch.group(0) ?? '';
+          final name = RegExp(r'name="([^"]+)"').firstMatch(tag)?.group(1);
+          final value = RegExp(r'value="([^"]*)"').firstMatch(tag)?.group(1);
+          if (name != null && name.isNotEmpty) {
+            hiddenFields[name] = value ?? '';
+          }
+        }
+        final execution = hiddenFields['execution'];
         DiagnosticLogService.instance.record(
           module: 'zhiyun',
           operation: 'loginFormSubmit',
           requestUri: current,
           message: '在 CAS 登录表单提交密码（第 $formSubmits 次，'
-              'execution=${execution != null ? '有' : '缺'}）',
+              '隐藏字段：${hiddenFields.keys.join('、')}）',
         );
-        if (execution != null) {
+        if (execution != null && execution.isNotEmpty) {
           try {
             final pwdEnc = await _encryptZjuamPassword(password);
-            final formRequest = await _client.postUrl(current).timeout(
+            // POST 到表单 action（纯路径，不带 query）。
+            final formAction =
+                Uri.https('zjuam.zju.edu.cn', '/cas/login');
+            final formRequest = await _client.postUrl(formAction).timeout(
                   const Duration(seconds: 10),
                   onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
                 );
@@ -273,13 +289,13 @@ class ZhiyunService {
                 formRequest.cookies.add(cookie);
               }
             }
-            formRequest.add(utf8.encode(Uri(queryParameters: {
-              'username': username,
-              'password': pwdEnc,
-              'execution': execution,
-              '_eventId': 'submit',
-              'rememberMe': 'true',
-            }).query));
+            // 全部隐藏字段 + 用户名/密码/rememberMe（浏览器同款）。
+            final fields = Map<String, String>.from(hiddenFields);
+            fields['username'] = username;
+            fields['password'] = pwdEnc;
+            fields['rememberMe'] = 'true';
+            fields['_eventId'] ??= 'submit';
+            formRequest.add(utf8.encode(Uri(queryParameters: fields).query));
             final formResponse = await formRequest.close().timeout(
                   const Duration(seconds: 10),
                   onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
@@ -293,7 +309,7 @@ class ZhiyunService {
             DiagnosticLogService.instance.record(
               module: 'zhiyun',
               operation: 'loginFormSubmit',
-              requestUri: current,
+              requestUri: formAction,
               statusCode: formResponse.statusCode,
               location: formLocation,
               message: '表单提交响应（第 $formSubmits 次）',
