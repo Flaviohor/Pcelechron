@@ -620,12 +620,16 @@ class ZhiyunService {
       final title =
           (asString(map['title']) ?? asString(map['sub_title']) ?? '').trim();
       DateTime? recordedAt;
-      final startAt = int.tryParse(asString(map['start_at']) ?? '');
+      // 文档·2.4：授课日期与 API 的 video_date / start_time 匹配。
+      // start_at/start_time 兼容秒与毫秒两种纪元，也兼容格式化字符串。
+      final startRaw = asString(map['start_at'] ?? map['start_time']) ?? '';
+      final startAt = int.tryParse(startRaw);
       if (startAt != null && startAt > 0) {
         recordedAt = DateTime.fromMillisecondsSinceEpoch(
             startAt > 100000000000 ? startAt : startAt * 1000);
       } else {
-        recordedAt = DateTime.tryParse(asString(map['date']) ?? '') ??
+        recordedAt = DateTime.tryParse(startRaw) ??
+            DateTime.tryParse(asString(map['date']) ?? '') ??
             DateTime.tryParse(asString(map['video_date']) ?? '');
       }
       subs.add(ZhiyunSub(subId: subId, title: title, recordedAt: recordedAt));
@@ -664,11 +668,14 @@ class ZhiyunService {
 
   // ===== 对卡片暴露的解析管线 =====
 
-  /// 解析课程 → 智云课节（直达参数）。
+  /// 解析课程 → 智云课节（直达参数），语义完全对齐文档·2.4/2.5：
   ///
-  /// [lessonDate] 为教务课表中最邻近的一节课的日期（当天 0 点）：
-  /// - 有值时，从课节目录中精确匹配该日期的回放 sub_id（跳转精确到课次）；
-  /// - 无值时，回退到最近一节。
+  /// [lessonDate] 为教务课表该节课的上课时刻（可空）：
+  /// - 有值时，从课节目录中精确匹配该日期的课节（录制日期同天，或标题
+  ///   含该日期）→ 直达该课节；未命中（回放未生成/该节未录）→ 直达
+  ///   课程主页（无 sub_id），绝不回退到别的课次；
+  /// - 无值时（课程列表等无节次入口），直达最近一节回放；
+  /// - 课程在智云不存在或目录为空 → notMatched（卡片隐藏）。
   static Future<ZhiyunResolve> resolveCourse({
     required String courseName,
     String? teacher,
@@ -684,21 +691,24 @@ class ZhiyunService {
       final map = asStringMap(jsonDecode(bound));
       final courseId = _asId(map?['course_id']);
       final subId = _asId(map?['sub_id']);
-      if (courseId != null && subId != null) {
+      if (courseId != null) {
         try {
           final token = await _getToken(username: username, password: password);
           final subs = await _fetchCatalogue(token, courseId);
-          final target = _pickSubForLesson(subs, lessonDate) ??
-              (subs.isNotEmpty ? subs.last : null);
-          final latestSubId = target?.subId ?? subId;
+          // 文档·2.4：同日命中直达该课节；未命中直达课程主页；
+          // 课程级入口取最近一节（目录为空时退回绑定缓存的课节）。
+          final target = lessonDate != null
+              ? _pickSubForLesson(subs, lessonDate)
+              : (subs.isNotEmpty ? subs.last : null);
+          final latestSubId = target?.subId ??
+              (lessonDate == null ? subId : null);
           return ZhiyunResolve.ready(
             courseId: courseId,
             latestSubId: latestSubId,
             subCount: subs.length,
             title: asString(map?['title']) ?? courseName,
             realname: asString(map?['teacher']) ?? '',
-            exactDay:
-                target != null && _isSameDay(target.recordedAt, lessonDate),
+            exactDay: lessonDate != null && target != null,
           );
         } on ZhiyunException catch (error) {
           return ZhiyunResolve.error(error.message);
@@ -744,24 +754,24 @@ class ZhiyunService {
     return a.year == b.year && a.month == b.month && a.day == b.day;
   }
 
-  /// 按上课日期精确匹配课节：优先同日，否则取最近一节早于上课日的；
-  /// 均无则返回 null（调用方回退到最新一节）。
+  /// 按上课日期精确匹配课节（文档·2.4）：同日才算命中——录制日期
+  /// 同天，或课节标题里含该日期（'2026-10-07' / '10月7日'）。
+  /// 未命中返回 null：调用方直达课程主页（livingroom?course_id=），
+  /// 绝不回退到别的课次，避免点 A 节跳到 B 节。
   static ZhiyunSub? _pickSubForLesson(List<ZhiyunSub> subs, DateTime? lessonDate) {
     if (lessonDate == null || subs.isEmpty) return null;
-    final lessonDay = DateTime(lessonDate.year, lessonDate.month, lessonDate.day);
-    // 同日精确匹配。
+    final dateKey =
+        '${lessonDate.year}-${lessonDate.month.toString().padLeft(2, '0')}'
+        '-${lessonDate.day.toString().padLeft(2, '0')}';
+    final shortKey = '${lessonDate.month}月${lessonDate.day}日';
     for (final sub in subs) {
-      if (_isSameDay(sub.recordedAt, lessonDate)) return sub;
-    }
-    // 无同日：取最晚的早于上课日的（上一次课的回放）。
-    ZhiyunSub? best;
-    for (final sub in subs) {
-      final d = sub.recordedAt;
-      if (d != null && d.isBefore(lessonDay)) {
-        best = sub;
+      if (_isSameDay(sub.recordedAt, lessonDate) ||
+          sub.title.contains(dateKey) ||
+          sub.title.contains(shortKey)) {
+        return sub;
       }
     }
-    return best;
+    return null;
   }
 
   static Future<ZhiyunResolve> _resolveWithToken(
@@ -782,22 +792,26 @@ class ZhiyunService {
       return const ZhiyunResolve.notMatched(); // 没上/没生成回放 → 隐藏
     }
 
-    // 按上课日期精确匹配课节；无精确匹配回退到最新一节。
-    final targetSub = _pickSubForLesson(subs, lessonDate) ?? subs.last;
-    final exactDay = _isSameDay(targetSub.recordedAt, lessonDate);
+    // 文档·2.4：同日命中 → 直达该课节；未命中（回放未生成/该节未录）
+    // → 直达课程主页（无 sub_id）；课程级入口（无 lessonDate）→ 最近一节。
+    final targetSub =
+        lessonDate != null ? _pickSubForLesson(subs, lessonDate) : subs.last;
+    final exactDay = targetSub != null && lessonDate != null;
 
-    final bindingKey = _bindingKey(courseName, teacher);
-    final binding = jsonEncode({
-      'course_id': matched.courseId,
-      'sub_id': targetSub.subId,
-      'title': matched.title,
-      'teacher': matched.realname,
-    });
-    _db?.setCachedWebPage(bindingKey, binding);
+    if (targetSub != null) {
+      final bindingKey = _bindingKey(courseName, teacher);
+      final binding = jsonEncode({
+        'course_id': matched.courseId,
+        'sub_id': targetSub.subId,
+        'title': matched.title,
+        'teacher': matched.realname,
+      });
+      _db?.setCachedWebPage(bindingKey, binding);
+    }
 
     return ZhiyunResolve.ready(
       courseId: matched.courseId,
-      latestSubId: targetSub.subId,
+      latestSubId: targetSub?.subId,
       subCount: subs.length,
       title: matched.title,
       realname: matched.realname,
@@ -805,10 +819,13 @@ class ZhiyunService {
     );
   }
 
-  /// 直达 URL（播放间拼接规范）。
-  static String livingroomUrl(int courseId, int subId) =>
-      'https://classroom.zju.edu.cn/livingroom?course_id=$courseId'
-      '&sub_id=$subId&tenant_code=$_tenantCode';
+  /// 直达 URL（播放间拼接规范，文档·2.4）：命中课节带 sub_id；
+  /// 未命中课节只带 course_id（课程主页）。
+  static String livingroomUrl(int courseId, {int? subId}) => subId == null
+      ? 'https://classroom.zju.edu.cn/livingroom?course_id=$courseId'
+          '&tenant_code=$_tenantCode'
+      : 'https://classroom.zju.edu.cn/livingroom?course_id=$courseId'
+          '&sub_id=$subId&tenant_code=$_tenantCode';
 }
 
 class _ZhiyunUnauthorized implements Exception {
@@ -835,7 +852,7 @@ class ZhiyunResolve {
   final String realname;
   final String errorMessage;
 
-  /// 匹配到的回放是否就是请求日期当天的课次（false = 回退到最近一节）。
+  /// 匹配到的回放是否就是请求日期当天的课次（false = 课程主页或最近一节）。
   final bool exactDay;
 
   const ZhiyunResolve._({
@@ -851,7 +868,7 @@ class ZhiyunResolve {
 
   const ZhiyunResolve.ready({
     required int courseId,
-    required int latestSubId,
+    int? latestSubId,
     required int subCount,
     required String title,
     required String realname,
