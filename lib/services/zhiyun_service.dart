@@ -159,8 +159,44 @@ class ZhiyunService {
       throw const ZhiyunException('统一认证登录页无法获取 execution');
     }
 
-    // 2) GET /cas/v2/getPubKey（同会话）→ RSA 公钥加密密码
-    final pwdEnc = await _encryptZjuamPassword(password);
+    // 2) GET /cas/v2/getPubKey（**同会话**：必须带登录页的 JSESSIONID，
+    //    CAS 可能按会话绑定 RSA 密钥——不带则密码解密失败表单重出）
+    final pubKeyReq = await _client
+        .getUrl(Uri.parse('https://zjuam.zju.edu.cn/cas/v2/getPubKey'))
+        .timeout(const Duration(seconds: 8),
+            onTimeout: () => throw const ZhiyunException('统一认证请求超时'));
+    pubKeyReq.followRedirects = false;
+    pubKeyReq.headers.set('User-Agent', _userAgent);
+    pubKeyReq.cookies.addAll(loginCookiesFor(casBase));
+    final pubKeyResp = await pubKeyReq.close().timeout(
+          const Duration(seconds: 8),
+          onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
+        );
+    for (final cookie in pubKeyResp.cookies) {
+      storeLogin(cookie, casBase);
+    }
+    final pubKeyBody = await _readBodyWithTimeout(pubKeyResp);
+    final publicKey = decodeJsonMap(
+        pubKeyBody,
+        context:
+            '智云 RSA 公钥；HTTP ${pubKeyResp.statusCode}');
+    final modulusStr = asString(publicKey['modulus']);
+    final exponentStr = asString(publicKey['exponent']);
+    if (modulusStr == null || exponentStr == null) {
+      throw ZhiyunException(
+          '智云 RSA 公钥字段缺失；响应摘要：${responseSummary(pubKeyBody)}');
+    }
+    late String pwdEnc;
+    try {
+      final modInt = BigInt.parse(modulusStr, radix: 16);
+      final expInt = BigInt.parse(exponentStr, radix: 16);
+      final pwdInt = BigInt.parse(
+          utf8.encode(password).map((e) => e.toRadixString(16)).join(),
+          radix: 16);
+      pwdEnc = pwdInt.modPow(expInt, modInt).toRadixString(16).padLeft(128, '0');
+    } on Object {
+      throw const ZhiyunException('统一认证：密码加密失败');
+    }
 
     // 3) POST /cas/login（同会话 + execution + 密文）→ iPlanet + TGT 会话
     final postReq = await _client.postUrl(casBase).timeout(
@@ -410,37 +446,6 @@ class ZhiyunService {
           const Duration(seconds: 10),
           onTimeout: () => throw const ZhiyunException('智云课堂响应读取超时'),
         );
-  }
-
-  /// 取统一认证 RSA 公钥并加密密码（浏览器同款），返回 128 位十六进制
-  /// 密文。公钥接口无会话依赖，表单重认证与带 service 登录共用。
-  static Future<String> _encryptZjuamPassword(String password) async {
-    final request = await _client
-        .getUrl(Uri.parse('https://zjuam.zju.edu.cn/cas/v2/getPubKey'))
-        .timeout(const Duration(seconds: 8),
-            onTimeout: () => throw const ZhiyunException('统一认证请求超时'));
-    request.followRedirects = false;
-    final response = await request.close().timeout(const Duration(seconds: 8),
-        onTimeout: () => throw const ZhiyunException('统一认证请求超时'));
-    final body = await _readBodyWithTimeout(response);
-    final publicKey = decodeJsonMap(
-        body, context: '统一认证 RSA 公钥；HTTP ${response.statusCode}');
-    final modulusStr = asString(publicKey['modulus']);
-    final exponentStr = asString(publicKey['exponent']);
-    if (modulusStr == null || exponentStr == null) {
-      throw ZhiyunException(
-          '统一认证 RSA 公钥字段缺失；响应摘要：${responseSummary(body)}');
-    }
-    try {
-      final modInt = BigInt.parse(modulusStr, radix: 16);
-      final expInt = BigInt.parse(exponentStr, radix: 16);
-      final pwdInt = BigInt.parse(
-          utf8.encode(password).map((e) => e.toRadixString(16)).join(),
-          radix: 16);
-      return pwdInt.modPow(expInt, modInt).toRadixString(16).padLeft(128, '0');
-    } on Object {
-      throw const ZhiyunException('统一认证：密码加密失败');
-    }
   }
 
   static Future<Map<String, dynamic>> _authedJson(
