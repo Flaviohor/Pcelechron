@@ -665,11 +665,16 @@ class ZhiyunService {
   // ===== 对卡片暴露的解析管线 =====
 
   /// 解析课程 → 智云课节（直达参数）。
+  ///
+  /// [lessonDate] 为教务课表中最邻近的一节课的日期（当天 0 点）：
+  /// - 有值时，从课节目录中精确匹配该日期的回放 sub_id（跳转精确到课次）；
+  /// - 无值时，回退到最近一节。
   static Future<ZhiyunResolve> resolveCourse({
     required String courseName,
     String? teacher,
     required String? username,
     required String? password,
+    DateTime? lessonDate,
   }) async {
     final bindingKey = _bindingKey(courseName, teacher);
 
@@ -683,10 +688,12 @@ class ZhiyunService {
         try {
           final token = await _getToken(username: username, password: password);
           final subs = await _fetchCatalogue(token, courseId);
-          final latest = subs.isEmpty ? subId : subs.last.subId;
+          final target = _pickSubForLesson(subs, lessonDate) ??
+              (subs.isNotEmpty ? subs.last : null);
+          final latestSubId = target?.subId ?? subId;
           return ZhiyunResolve.ready(
             courseId: courseId,
-            latestSubId: latest,
+            latestSubId: latestSubId,
             subCount: subs.length,
             title: asString(map?['title']) ?? courseName,
             realname: asString(map?['teacher']) ?? '',
@@ -712,13 +719,15 @@ class ZhiyunService {
     }
 
     try {
-      return await _resolveWithToken(token, courseName, teacher);
+      return await _resolveWithToken(token, courseName, teacher,
+          lessonDate: lessonDate);
     } on _ZhiyunUnauthorized {
       // token 失效：清缓存重登一次后重放。
       _reloginZhiyun();
       try {
         final fresh = await _getToken(username: username, password: password);
-        return await _resolveWithToken(fresh, courseName, teacher);
+        return await _resolveWithToken(fresh, courseName, teacher,
+            lessonDate: lessonDate);
       } on ZhiyunException catch (error) {
         return ZhiyunResolve.error(error.message);
       }
@@ -727,8 +736,35 @@ class ZhiyunService {
     }
   }
 
+  /// 按上课日期精确匹配课节：优先同日，否则取最近一节早于上课日的；
+  /// 均无则返回 null（调用方回退到最新一节）。
+  static ZhiyunSub? _pickSubForLesson(List<ZhiyunSub> subs, DateTime? lessonDate) {
+    if (lessonDate == null || subs.isEmpty) return null;
+    final lessonDay = DateTime(lessonDate.year, lessonDate.month, lessonDate.day);
+    // 同日精确匹配。
+    for (final sub in subs) {
+      final d = sub.recordedAt;
+      if (d != null &&
+          d.year == lessonDay.year &&
+          d.month == lessonDay.month &&
+          d.day == lessonDay.day) {
+        return sub;
+      }
+    }
+    // 无同日：取最晚的早于上课日的（上一次课的回放）。
+    ZhiyunSub? best;
+    for (final sub in subs) {
+      final d = sub.recordedAt;
+      if (d != null && d.isBefore(lessonDay)) {
+        best = sub;
+      }
+    }
+    return best;
+  }
+
   static Future<ZhiyunResolve> _resolveWithToken(
-      String token, String courseName, String? teacher) async {
+      String token, String courseName, String? teacher,
+      {DateTime? lessonDate}) async {
     final matched = await _searchCourse(token, courseName, teacher);
     if (matched == null) {
       DiagnosticLogService.instance.record(
@@ -744,10 +780,13 @@ class ZhiyunService {
       return const ZhiyunResolve.notMatched(); // 没上/没生成回放 → 隐藏
     }
 
+    // 按上课日期精确匹配课节；无精确匹配回退到最新一节。
+    final targetSub = _pickSubForLesson(subs, lessonDate) ?? subs.last;
+
     final bindingKey = _bindingKey(courseName, teacher);
     final binding = jsonEncode({
       'course_id': matched.courseId,
-      'sub_id': subs.last.subId,
+      'sub_id': targetSub.subId,
       'title': matched.title,
       'teacher': matched.realname,
     });
@@ -755,7 +794,7 @@ class ZhiyunService {
 
     return ZhiyunResolve.ready(
       courseId: matched.courseId,
-      latestSubId: subs.last.subId,
+      latestSubId: targetSub.subId,
       subCount: subs.length,
       title: matched.title,
       realname: matched.realname,

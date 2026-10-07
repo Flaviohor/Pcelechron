@@ -598,8 +598,9 @@ class _ClassroomSectionState extends State<_ClassroomSection> {
       _phase = _ZhiyunPhase.checking;
       _detail = '';
     });
-    // 显示时机控制（文档·2.5）：整门课的所有节次都尚未开课时不展示
-    // 卡片——未来课程没有录播，显示空白卡片只会引发误解与无谓请求。
+    // 显示时机控制（文档·2.5 精化）：只有正在直播（当前时间在某节次的
+    // 起止之间）或已生成回放（至少有一节课已上完）的课次才展示卡片；
+    // 整门课尚未开课、或最近一节课还没到时不展示——未来课程没有录播。
     // 课表节次（scholar.periods）经 session.id 与本课程关联。
     final scholar = Get.find<Rx<Scholar>>(tag: 'scholar').value;
     final now = DateTime.now();
@@ -610,9 +611,17 @@ class _ClassroomSectionState extends State<_ClassroomSection> {
     final coursePeriods = scholar.periods
         .where((period) =>
             period.fromUid != null && sessionIds.contains(period.fromUid))
+        .toList()
+      ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    if (coursePeriods.isEmpty) {
+      _finish(_ZhiyunPhase.hidden, '');
+      return;
+    }
+    // 最近一节已开始（含正在直播）的课次；全在未来则隐藏。
+    final latestStarted = coursePeriods
+        .where((period) => !now.isBefore(period.startTime))
         .toList();
-    if (coursePeriods.isNotEmpty &&
-        coursePeriods.every((period) => now.isBefore(period.startTime))) {
+    if (latestStarted.isEmpty) {
       _finish(_ZhiyunPhase.hidden, '');
       return;
     }
@@ -620,6 +629,8 @@ class _ClassroomSectionState extends State<_ClassroomSection> {
       _finish(_ZhiyunPhase.error, '未登录，登录后即可关联智云课堂回放');
       return;
     }
+    // 精确跳转：把最近一节已开始课次的日期传给智云服务，匹配同日回放。
+    final lessonDate = latestStarted.last.startTime;
     ZhiyunResolve result;
     try {
       result = await ZhiyunService.resolveCourse(
@@ -627,6 +638,7 @@ class _ClassroomSectionState extends State<_ClassroomSection> {
         teacher: widget.course.teacher,
         username: scholar.username,
         password: scholar.password,
+        lessonDate: lessonDate,
       );
     } on ZhiyunException catch (error) {
       // 任何未预期异常都不允许把卡片留在 checking 态（永远转圈）。
