@@ -23,11 +23,14 @@ class CourseDetailPage extends StatelessWidget {
   late final Course course;
   late final String _courseId;
 
-  /// 从日历/时间线点击某节课进入时传入该节次的上课日期——智云卡片
-  /// 按此日期精确匹配回放课次；从课程列表进入时为 null（用最新一节）。
+  /// 从日历/时间线点击某节课进入时传入该节次的起止时刻——智云卡片
+  /// 只在该节次直播中或回放已生成时展示，并直达本节；从课程列表进入
+  /// 时为 null（按整门课判定）。
   final DateTime? sessionDate;
+  final DateTime? sessionEnd;
 
-  CourseDetailPage({required courseId, this.sessionDate, super.key}) {
+  CourseDetailPage(
+      {required courseId, this.sessionDate, this.sessionEnd, super.key}) {
     course = _scholar.value.semesters
         .firstWhere((e) => e.courses.containsKey(courseId))
         .courses[courseId]!;
@@ -571,17 +574,20 @@ class CourseDetailPage extends StatelessWidget {
   /// error（登录失败、网络不可达等）保留卡片并显示原因，点击回退到
   /// 智云官网首页——失败可见，不静默消失。
   Widget _buildClassroomSection(BuildContext context) {
-    return _ClassroomSection(course: course, sessionDate: sessionDate);
+    return _ClassroomSection(
+        course: course, sessionDate: sessionDate, sessionEnd: sessionEnd);
   }
 }
 
 class _ClassroomSection extends StatefulWidget {
-  const _ClassroomSection({required this.course, this.sessionDate});
+  const _ClassroomSection(
+      {required this.course, this.sessionDate, this.sessionEnd});
 
   final Course course;
 
-  /// 从日历/时间线点入时的上课日期（精确到课次的回放匹配）。
+  /// 从日历/时间线点入时该节课的起止时刻；为 null 时按整门课判定。
   final DateTime? sessionDate;
+  final DateTime? sessionEnd;
 
   @override
   State<_ClassroomSection> createState() => _ClassroomSectionState();
@@ -605,46 +611,35 @@ class _ClassroomSectionState extends State<_ClassroomSection> {
       _phase = _ZhiyunPhase.checking;
       _detail = '';
     });
-    // 显示时机控制（文档·2.5 精化）：
-    // - 从日历/时间线点入（sessionDate 有值）：该节课尚未开始 → 隐藏；
-    //   已开始 → 展示，并把该日期传给智云服务精确匹配同日回放。
-    // - 从课程列表进入（sessionDate 为 null）：找最近一节已开始（含正在
-    //   直播）的课次；全未来 → 隐藏。
-    // 课表节次（scholar.periods）经 session.id 与本课程关联。
+    // 显示时机控制（Helechron 同款）：卡片只在「该节课正在直播或回放
+    // 已生成」时展示，显隐判定全部交给 ZhiyunService.resolveCourse——
+    // 绝不回退到其它课次。这里只做零成本的本地预判：
+    // - 日历/时间线点入（sessionDate 有值）：还没到上课时间 → 隐藏，
+    //   不发网络请求；
+    // - 课程列表进入（sessionDate 为 null）：整门课所有节次都在未来
+    //   （尚未开课）→ 隐藏。
     final scholar = Get.find<Rx<Scholar>>(tag: 'scholar').value;
     final now = DateTime.now();
     final sessionDate = widget.sessionDate;
     if (sessionDate != null && now.isBefore(sessionDate)) {
-      // 点入的是未来的课次：没有录播，隐藏。
       _finish(_ZhiyunPhase.hidden, '');
       return;
     }
-    final sessionIds = widget.course.sessions
-        .map((session) => session.id)
-        .whereType<String>()
-        .toSet();
-    final coursePeriods = scholar.periods
-        .where((period) =>
-            period.fromUid != null && sessionIds.contains(period.fromUid))
-        .toList()
-      ..sort((a, b) => a.startTime.compareTo(b.startTime));
-    if (coursePeriods.isEmpty) {
-      _finish(_ZhiyunPhase.hidden, '');
-      return;
+    if (sessionDate == null) {
+      final sessionIds = widget.course.sessions
+          .map((session) => session.id)
+          .whereType<String>()
+          .toSet();
+      final coursePeriods = scholar.periods.where((period) =>
+          period.fromUid != null && sessionIds.contains(period.fromUid));
+      if (coursePeriods.isNotEmpty &&
+          coursePeriods.every((p) => now.isBefore(p.startTime))) {
+        _finish(_ZhiyunPhase.hidden, '');
+        return;
+      }
     }
     if (!scholar.isLogan) {
       _finish(_ZhiyunPhase.error, '未登录，登录后即可关联智云课堂回放');
-      return;
-    }
-    // 精确跳转：sessionDate 有值用之（日历点入的课次日期）；否则取最近
-    // 一节已开始课次的日期。
-    final lessonDate = sessionDate ??
-        coursePeriods
-            .where((period) => !now.isBefore(period.startTime))
-            .map((period) => period.startTime)
-            .fold<DateTime?>(null, (a, b) => (a == null || b.isAfter(a)) ? b : a);
-    if (lessonDate == null) {
-      _finish(_ZhiyunPhase.hidden, '');
       return;
     }
     ZhiyunResolve result;
@@ -654,7 +649,8 @@ class _ClassroomSectionState extends State<_ClassroomSection> {
         teacher: widget.course.teacher,
         username: scholar.username,
         password: scholar.password,
-        lessonDate: lessonDate,
+        lessonDate: sessionDate,
+        lessonEnd: widget.sessionEnd,
       );
     } on ZhiyunException catch (error) {
       // 任何未预期异常都不允许把卡片留在 checking 态（永远转圈）。
@@ -842,12 +838,14 @@ class _ClassroomSectionState extends State<_ClassroomSection> {
     final result = _result;
     if (result == null) return '';
     final teacher = result.realname.isEmpty ? '' : ' · ${result.realname}';
-    final sessionDate = widget.sessionDate;
-    if (sessionDate != null) {
-      // 从日历/时间线点入：明确告知直达的是本节，还是退而求其次的最近一节。
-      return result.exactDay
-          ? '已定位到本节（${sessionDate.month}月${sessionDate.day}日）的回放/直播$teacher，点击直达（需校园网）'
-          : '本节回放尚未生成，已匹配最近一节$teacher，点击直达（需校园网）';
+    if (result.isLive) {
+      return widget.sessionDate != null
+          ? '本节课正在直播$teacher，点击直达（需校园网）'
+          : '正在直播$teacher，点击直达（需校园网）';
+    }
+    if (widget.sessionDate != null) {
+      final d = widget.sessionDate!;
+      return '已定位到本节（${d.month}月${d.day}日）的回放$teacher，点击直达（需校园网）';
     }
     return '已匹配到 ${result.subCount} 节回放$teacher，点击直达最近一节（需校园网）';
   }
