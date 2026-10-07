@@ -287,6 +287,8 @@ class ZhiyunService {
                 );
             formRequest.followRedirects = false;
             formRequest.headers.set('User-Agent', _userAgent);
+            formRequest.headers.set('Referer', current.toString());
+            formRequest.headers.set('Origin', 'https://zjuam.zju.edu.cn');
             formRequest.headers.contentType = ContentType(
                 'application', 'x-www-form-urlencoded', charset: 'utf-8');
             for (final cookie in cookieJar.values) {
@@ -294,11 +296,21 @@ class ZhiyunService {
                 formRequest.cookies.add(cookie);
               }
             }
+            // Spring Security CSRF：_csrf Cookie 已随请求发送，还须以
+            // X-CSRF-TOKEN 头 + _csrf 表单字段回传同值 token（1.3.5.28
+            // 实测只发 Cookie 不带 token 会被 403）。
+            final csrfCookie = cookieJar['_csrf|zjuam.zju.edu.cn'];
+            if (csrfCookie != null && csrfCookie.value.isNotEmpty) {
+              formRequest.headers.set('X-CSRF-TOKEN', csrfCookie.value);
+            }
             // 全部隐藏字段 + 用户名/密码/rememberMe（浏览器同款）。
             final fields = Map<String, String>.from(hiddenFields);
             fields['username'] = username;
             fields['password'] = pwdEnc;
             fields['rememberMe'] = 'true';
+            if (csrfCookie != null && csrfCookie.value.isNotEmpty) {
+              fields['_csrf'] ??= csrfCookie.value;
+            }
             fields['_eventId'] ??= 'submit';
             formRequest.add(utf8.encode(Uri(queryParameters: fields).query));
             final formResponse = await formRequest.close().timeout(
