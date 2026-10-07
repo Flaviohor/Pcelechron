@@ -4,7 +4,6 @@ import 'dart:io';
 
 import 'package:celechron/database/database_helper.dart';
 import 'package:celechron/http/zjuServices/response_utils.dart';
-import 'package:celechron/http/zjuServices/zjuam.dart';
 import 'package:celechron/services/diagnostic_log_service.dart';
 import 'package:crypto/crypto.dart';
 import 'package:get/get.dart';
@@ -104,16 +103,122 @@ class ZhiyunService {
     _db?.setCachedWebPage(_tokenKey, '');
   }
 
-  /// tgmedia 入口全链跟随登录（Helechron 算法移植）。
+  /// tgmedia 入口全链跟随登录。
+  ///
+  /// 关键改进（区别于 Helechron 原版）：先执行完整的 zjuam 三步密码登录
+  /// （GET 表单 → getPubKey → POST），把登录响应的**全部** Cookie（含
+  /// 承载 TGT 的 JSESSIONID + iPlanet）放入罐，再起 tgmedia 链——authorize
+  /// 拿到 TGT 会话后直接签发 code，**不会踢到登录表单**。Helechron 原版
+  /// 只带 iPlanet 起链，authorize 无 TGT 时踢回表单、纯跟随循环无法处理
+  /// （1.3.5.26/27/28/29 连续四版日志实证）。
   static Future<String> _loginZhiyun(String username, String password) async {
-    final ssoCookie = await ZjuAm.getSsoCookie(_client, username, password);
-    if (ssoCookie == null) {
-      throw const ZhiyunException('统一认证未登录');
+    // ===== 第一步：zjuam 三步密码登录（ZjuAm._getSsoCookie 同款） =====
+    final loginJar = <String, Cookie>{};
+
+    void storeLogin(Cookie cookie, Uri source) {
+      final domain = (cookie.domain == null || cookie.domain!.trim().isEmpty
+              ? source.host
+              : cookie.domain!)
+          .toLowerCase()
+          .replaceFirst(RegExp(r'^\.'), '');
+      cookie.domain = domain;
+      cookie.path = '/';
+      loginJar['${cookie.name}|$domain'] = cookie;
     }
 
-    // 扁平 Cookie 罐：按 name|domain 存，不做 path 维度划分——同名多 path
-    // 的旧 Cookie 混入链路会破坏 CAS 会话（此前自研链失败的教训之一）。
+    List<Cookie> loginCookiesFor(Uri uri) {
+      final host = uri.host.toLowerCase();
+      return loginJar.values.where((cookie) {
+        final domain = (cookie.domain ?? '')
+            .toLowerCase()
+            .replaceFirst(RegExp(r'^\.'), '');
+        return domain.isEmpty || host == domain || host.endsWith('.$domain');
+      }).toList();
+    }
+
+    // 1) GET /cas/login → JSESSIONID + execution
+    final casBase = Uri.parse('https://zjuam.zju.edu.cn/cas/login');
+    final getReq = await _client.getUrl(casBase).timeout(
+          const Duration(seconds: 8),
+          onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
+        );
+    getReq.followRedirects = false;
+    getReq.headers.set('User-Agent', _userAgent);
+    final getResp = await getReq.close().timeout(
+          const Duration(seconds: 8),
+          onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
+        );
+    for (final cookie in getResp.cookies) {
+      storeLogin(cookie, casBase);
+    }
+    final loginBody = await _readBodyWithTimeout(getResp);
+    final execution = RegExp(r'name="execution" value="(.*?)"')
+        .firstMatch(loginBody)
+        ?.group(1);
+    if (execution == null) {
+      throw const ZhiyunException('统一认证登录页无法获取 execution');
+    }
+
+    // 2) GET /cas/v2/getPubKey（同会话）→ RSA 公钥加密密码
+    final pwdEnc = await _encryptZjuamPassword(password);
+
+    // 3) POST /cas/login（同会话 + execution + 密文）→ iPlanet + TGT 会话
+    final postReq = await _client.postUrl(casBase).timeout(
+          const Duration(seconds: 8),
+          onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
+        );
+    postReq.followRedirects = false;
+    postReq.headers.set('User-Agent', _userAgent);
+    postReq.headers.contentType =
+        ContentType('application', 'x-www-form-urlencoded', charset: 'utf-8');
+    postReq.cookies.addAll(loginCookiesFor(casBase));
+    postReq.add(utf8.encode(Uri(queryParameters: {
+      'username': username,
+      'password': pwdEnc,
+      'execution': execution,
+      '_eventId': 'submit',
+      'rememberMe': 'true',
+    }).query));
+    final postResp = await postReq.close().timeout(
+          const Duration(seconds: 8),
+          onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
+        );
+    for (final cookie in postResp.cookies) {
+      storeLogin(cookie, casBase);
+    }
+    final hasIPlanet = postResp.cookies
+        .any((c) => c.name == 'iPlanetDirectoryPro' && c.value.isNotEmpty);
+    final postLocation = postResp.headers.value(HttpHeaders.locationHeader);
+    DiagnosticLogService.instance.record(
+      module: 'zhiyun',
+      operation: 'zjuamLogin',
+      requestUri: casBase,
+      statusCode: postResp.statusCode,
+      location: postLocation,
+      message: hasIPlanet
+          ? '密码登录成功（iPlanet 已签发，TGT 会话已建立）'
+          : '密码登录未签发 iPlanet',
+    );
+    await _readBodyWithTimeout(postResp);
+    if (!hasIPlanet) {
+      throw const ZhiyunException('统一认证密码登录失败（学号或密码错误）');
+    }
+
+    // ===== 第二步：tgmedia 全链跟随（TGT 会话在罐中） =====
+    // 把 zjuam 登录的全部 Cookie 拷入链路罐：iPlanet 挂 zju.edu.cn 父域
+    // （tgmedia 的 OpenAM Agent 需要它），JSESSIONID 保留 zjuam 精确域
+    // （authorize 的 TGT 会话）。
     final cookieJar = <String, Cookie>{};
+    for (final cookie in loginJar.values) {
+      if (cookie.name == 'iPlanetDirectoryPro') {
+        final copy = Cookie(cookie.name, cookie.value)
+          ..domain = 'zju.edu.cn'
+          ..path = '/';
+        cookieJar['${cookie.name}|zju.edu.cn'] = copy;
+      } else {
+        cookieJar['${cookie.name}|${cookie.domain}'] = cookie;
+      }
+    }
 
     void storeCookie(Cookie cookie, Uri source) {
       final domain = (cookie.domain == null || cookie.domain!.trim().isEmpty
@@ -121,10 +226,6 @@ class ZhiyunService {
               : cookie.domain!)
           .toLowerCase()
           .replaceFirst(RegExp(r'^\.'), '');
-      // 归一化结果必须写回 cookie.domain：否则 domain 保持 null，
-      // 表单提交按域过滤时匹配不到（POST 不带 JSESSIONID → CAS 302
-      // 回踢，1.3.5.26/27 两版的根因），cookiesFor 也会把无域 Cookie
-      // 发给所有主机。
       cookie.domain = domain;
       cookie.path = '/';
       cookieJar['${cookie.name}|$domain'] = cookie;
@@ -140,20 +241,9 @@ class ZhiyunService {
       }).toList();
     }
 
-    final trustedSso = Cookie(ssoCookie.name, ssoCookie.value)
-      ..domain = 'zju.edu.cn'
-      ..path = '/';
-    storeCookie(trustedSso, Uri.parse('https://zjuam.zju.edu.cn/'));
-
-    // 兜底（浏览器同款）：链路与 Helechron 一致，但若中途踢到 zjuam CAS
-    // 登录表单（authorize 拿不到 TGT 会话时会发生，getSsoCookie 的
-    // JSESSIONID 在 ZjuAm 内部被丢弃），就就着当前表单、当前会话提交
-    // 密码——Cookie 只带 zjuam 精确域的（JSESSIONID/_csrf），排除父域
-    // iPlanet（1.3.5.19 实测带上 iPlanet 提交会被 CAS 以 200 拒绝）。
     var current = Uri.parse(_ssoEntryUrl);
     final stopwatch = Stopwatch()..start();
     String? token;
-    var formSubmits = 0;
 
     for (var hop = 0; hop < 12; hop++) {
       if (stopwatch.elapsed > const Duration(seconds: 45)) {
@@ -240,116 +330,19 @@ class ZhiyunService {
         continue;
       }
 
-      // 落在 zjuam CAS 登录表单（200 + execution）：authorize 找不到 TGT
-      // 会话时踢到这里——浏览器同款动作是「就着当前表单、当前会话提交
-      // 密码」。两个关键细节（1.3.5.26 教训，POST 被 302 回表单）：
-      // 1) POST 到表单 action（/cas/login 纯路径，**不带 query**）——
-      //    service 由服务端会话（execution）保管，带上 ?service= 反而
-      //    会被 CAS 以 302 回踢；
-      // 2) 提交表单里**全部**隐藏字段（execution/_eventId/ys 等），不是
-      //    只发 execution——漏掉 ys 等字段同样被拒。
-      // Cookie 只带 zjuam 精确域（该会话的 JSESSIONID/_csrf），排除父域
-      // iPlanet（1.3.5.19 实测带上会被 CAS 拒）。
-      if (formSubmits < 2 &&
-          response.statusCode == HttpStatus.ok &&
+      // TGT 会话在罐中，authorize 应直接放行。若仍被踢到表单（服务端
+      // 行为异常），记录详情后结束（不再盲目提交密码——校内/校外多版
+      // 表单提交方案均被 CAS 拒，保留 TGT 会话才是正解）。
+      if (response.statusCode == HttpStatus.ok &&
           current.host == 'zjuam.zju.edu.cn' &&
-          current.path.startsWith('/cas/login') &&
-          body.contains('name="execution"')) {
-        formSubmits++;
-        // 提取表单全部隐藏字段（浏览器同款提交）。
-        final hiddenFields = <String, String>{};
-        for (final tagMatch
-            in RegExp(r'<input[^>]*type="hidden"[^>]*>').allMatches(body)) {
-          final tag = tagMatch.group(0) ?? '';
-          final name = RegExp(r'name="([^"]+)"').firstMatch(tag)?.group(1);
-          final value = RegExp(r'value="([^"]*)"').firstMatch(tag)?.group(1);
-          if (name != null && name.isNotEmpty) {
-            hiddenFields[name] = value ?? '';
-          }
-        }
-        final execution = hiddenFields['execution'];
+          current.path.startsWith('/cas/login')) {
         DiagnosticLogService.instance.record(
           module: 'zhiyun',
-          operation: 'loginFormSubmit',
+          operation: 'loginFormHit',
           requestUri: current,
-          message: '在 CAS 登录表单提交密码（第 $formSubmits 次，'
-              '隐藏字段：${hiddenFields.keys.join('、')}）',
+          message: 'TGT 会话在罐中仍被踢到 CAS 登录表单——服务端行为异常',
+          error: body.length > 200 ? body.substring(0, 200) : body,
         );
-        if (execution != null && execution.isNotEmpty) {
-          try {
-            final pwdEnc = await _encryptZjuamPassword(password);
-            // POST 到表单 action（纯路径，不带 query）。
-            final formAction =
-                Uri.https('zjuam.zju.edu.cn', '/cas/login');
-            final formRequest = await _client.postUrl(formAction).timeout(
-                  const Duration(seconds: 10),
-                  onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
-                );
-            formRequest.followRedirects = false;
-            formRequest.headers.set('User-Agent', _userAgent);
-            formRequest.headers.set('Referer', current.toString());
-            formRequest.headers.set('Origin', 'https://zjuam.zju.edu.cn');
-            formRequest.headers.contentType = ContentType(
-                'application', 'x-www-form-urlencoded', charset: 'utf-8');
-            for (final cookie in cookieJar.values) {
-              if (cookie.domain == 'zjuam.zju.edu.cn') {
-                formRequest.cookies.add(cookie);
-              }
-            }
-            // Spring Security CSRF：_csrf Cookie 已随请求发送，还须以
-            // X-CSRF-TOKEN 头 + _csrf 表单字段回传同值 token（1.3.5.28
-            // 实测只发 Cookie 不带 token 会被 403）。
-            final csrfCookie = cookieJar['_csrf|zjuam.zju.edu.cn'];
-            if (csrfCookie != null && csrfCookie.value.isNotEmpty) {
-              formRequest.headers.set('X-CSRF-TOKEN', csrfCookie.value);
-            }
-            // 全部隐藏字段 + 用户名/密码/rememberMe（浏览器同款）。
-            final fields = Map<String, String>.from(hiddenFields);
-            fields['username'] = username;
-            fields['password'] = pwdEnc;
-            fields['rememberMe'] = 'true';
-            if (csrfCookie != null && csrfCookie.value.isNotEmpty) {
-              fields['_csrf'] ??= csrfCookie.value;
-            }
-            fields['_eventId'] ??= 'submit';
-            formRequest.add(utf8.encode(Uri(queryParameters: fields).query));
-            final formResponse = await formRequest.close().timeout(
-                  const Duration(seconds: 10),
-                  onTimeout: () => throw const ZhiyunException('统一认证请求超时'),
-                );
-            for (final cookie in formResponse.cookies) {
-              storeCookie(cookie, current);
-            }
-            final formLocation =
-                formResponse.headers.value(HttpHeaders.locationHeader);
-            await _readBodyWithTimeout(formResponse);
-            DiagnosticLogService.instance.record(
-              module: 'zhiyun',
-              operation: 'loginFormSubmit',
-              requestUri: formAction,
-              statusCode: formResponse.statusCode,
-              location: formLocation,
-              message: '表单提交响应（第 $formSubmits 次）',
-            );
-            if (isHttpRedirectStatus(formResponse.statusCode) &&
-                formLocation != null &&
-                formLocation.isNotEmpty) {
-              current = current.resolve(formLocation);
-              if (current.queryParameters.containsKey('token')) {
-                token = current.queryParameters['token'];
-              }
-              if (current.queryParameters.containsKey('_token')) {
-                token = current.queryParameters['_token'];
-              }
-              continue;
-            }
-            // 200/其它：密码被拒或表单重出——回到循环顶部重新 GET 当前
-            // URL 再试一次（formSubmits 已限 2 次）。
-            continue;
-          } on ZhiyunException {
-            // 加密/提交失败：落回正常流程，由 loginFailed 带停留点。
-          }
-        }
       }
       break;
     }
