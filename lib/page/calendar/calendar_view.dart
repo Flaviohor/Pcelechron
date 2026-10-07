@@ -401,7 +401,8 @@ class CalendarPage extends StatelessWidget {
     if (period.type == PeriodType.classes || period.type == PeriodType.test) {
       Navigator.of(context, rootNavigator: true).push(
         GlassPageRoute(
-            builder: (context) => CourseDetailPage(courseId: period.fromUid)),
+            builder: (context) => CourseDetailPage(
+                courseId: period.fromUid, sessionDate: period.startTime)),
       );
     } else if (period.type == PeriodType.user) {
       Task? deadline;

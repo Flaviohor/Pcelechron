@@ -697,6 +697,8 @@ class ZhiyunService {
             subCount: subs.length,
             title: asString(map?['title']) ?? courseName,
             realname: asString(map?['teacher']) ?? '',
+            exactDay:
+                target != null && _isSameDay(target.recordedAt, lessonDate),
           );
         } on ZhiyunException catch (error) {
           return ZhiyunResolve.error(error.message);
@@ -736,6 +738,12 @@ class ZhiyunService {
     }
   }
 
+  /// 只比日期（年月日），忽略时分秒。
+  static bool _isSameDay(DateTime? a, DateTime? b) {
+    if (a == null || b == null) return false;
+    return a.year == b.year && a.month == b.month && a.day == b.day;
+  }
+
   /// 按上课日期精确匹配课节：优先同日，否则取最近一节早于上课日的；
   /// 均无则返回 null（调用方回退到最新一节）。
   static ZhiyunSub? _pickSubForLesson(List<ZhiyunSub> subs, DateTime? lessonDate) {
@@ -743,13 +751,7 @@ class ZhiyunService {
     final lessonDay = DateTime(lessonDate.year, lessonDate.month, lessonDate.day);
     // 同日精确匹配。
     for (final sub in subs) {
-      final d = sub.recordedAt;
-      if (d != null &&
-          d.year == lessonDay.year &&
-          d.month == lessonDay.month &&
-          d.day == lessonDay.day) {
-        return sub;
-      }
+      if (_isSameDay(sub.recordedAt, lessonDate)) return sub;
     }
     // 无同日：取最晚的早于上课日的（上一次课的回放）。
     ZhiyunSub? best;
@@ -782,6 +784,7 @@ class ZhiyunService {
 
     // 按上课日期精确匹配课节；无精确匹配回退到最新一节。
     final targetSub = _pickSubForLesson(subs, lessonDate) ?? subs.last;
+    final exactDay = _isSameDay(targetSub.recordedAt, lessonDate);
 
     final bindingKey = _bindingKey(courseName, teacher);
     final binding = jsonEncode({
@@ -798,6 +801,7 @@ class ZhiyunService {
       subCount: subs.length,
       title: matched.title,
       realname: matched.realname,
+      exactDay: exactDay,
     );
   }
 
@@ -831,6 +835,9 @@ class ZhiyunResolve {
   final String realname;
   final String errorMessage;
 
+  /// 匹配到的回放是否就是请求日期当天的课次（false = 回退到最近一节）。
+  final bool exactDay;
+
   const ZhiyunResolve._({
     required this.kind,
     this.courseId,
@@ -839,6 +846,7 @@ class ZhiyunResolve {
     this.title = '',
     this.realname = '',
     this.errorMessage = '',
+    this.exactDay = false,
   });
 
   const ZhiyunResolve.ready({
@@ -847,6 +855,7 @@ class ZhiyunResolve {
     required int subCount,
     required String title,
     required String realname,
+    bool exactDay = false,
   }) : this._(
           kind: ZhiyunResolveKind.ready,
           courseId: courseId,
@@ -854,6 +863,7 @@ class ZhiyunResolve {
           subCount: subCount,
           title: title,
           realname: realname,
+          exactDay: exactDay,
         );
 
   const ZhiyunResolve.notMatched() : this._(kind: ZhiyunResolveKind.notMatched);
