@@ -43,8 +43,7 @@ class FlowPage extends StatelessWidget {
                   GlassPageRoute(
                       builder: (context) => CourseDetailPage(
                           courseId: period.fromUid,
-                          sessionDate: period.startTime,
-                          sessionEnd: period.endTime)))
+                          sessionDate: period.startTime)))
               : null,
           child: Padding(
             padding: const EdgeInsets.only(left: 8, right: 8),
@@ -293,8 +292,7 @@ class FlowPage extends StatelessWidget {
                     GlassPageRoute(
                         builder: (context) => CourseDetailPage(
                             courseId: period.fromUid,
-                            sessionDate: period.startTime,
-                            sessionEnd: period.endTime)))
+                            sessionDate: period.startTime)))
                 : null,
             child: Padding(
               padding: const EdgeInsets.only(left: 8, right: 8),

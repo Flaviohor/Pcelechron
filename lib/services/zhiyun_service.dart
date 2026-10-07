@@ -628,8 +628,7 @@ class ZhiyunService {
         recordedAt = DateTime.tryParse(asString(map['date']) ?? '') ??
             DateTime.tryParse(asString(map['video_date']) ?? '');
       }
-      subs.add(ZhiyunSub(
-          subId: subId, title: title, recordedAt: recordedAt, raw: map));
+      subs.add(ZhiyunSub(subId: subId, title: title, recordedAt: recordedAt));
     }
     subs.sort((a, b) {
       final at = a.recordedAt, bt = b.recordedAt;
@@ -665,42 +664,41 @@ class ZhiyunService {
 
   // ===== 对卡片暴露的解析管线 =====
 
-  /// 解析课程 → 智云课节（直达参数）。显隐与直达完全对齐 Helechron：
-  /// 只有「正在直播」或「已生成回放」的课次才返回 ready，其余一律
-  /// notMatched（卡片整段隐藏）——绝不回退到别的课次。
+  /// 解析课程 → 智云课节（直达参数）。
   ///
-  /// [lessonDate]/[lessonEnd] 为教务课表该节课的起止时刻（可空：
-  /// 从课程列表等无节次入口进入时按整门课判定）。
+  /// [lessonDate] 为教务课表中最邻近的一节课的日期（当天 0 点）：
+  /// - 有值时，从课节目录中精确匹配该日期的回放 sub_id（跳转精确到课次）；
+  /// - 无值时，回退到最近一节。
   static Future<ZhiyunResolve> resolveCourse({
     required String courseName,
     String? teacher,
     required String? username,
     required String? password,
     DateTime? lessonDate,
-    DateTime? lessonEnd,
   }) async {
     final bindingKey = _bindingKey(courseName, teacher);
 
     // 显式绑定优先：曾经成功匹配过就直接信任绑定。
     final bound = _db?.getCachedWebPage(bindingKey) ?? '';
-    if (bound.isEmpty && !isRecordableCourse(courseName)) {
-      // 未绑定且属体育/实践等非录播课程 → 坚决不展示（Helechron 同款）。
-      return const ZhiyunResolve.notMatched();
-    }
     if (bound.isNotEmpty) {
       final map = asStringMap(jsonDecode(bound));
       final courseId = _asId(map?['course_id']);
-      if (courseId != null) {
+      final subId = _asId(map?['sub_id']);
+      if (courseId != null && subId != null) {
         try {
           final token = await _getToken(username: username, password: password);
           final subs = await _fetchCatalogue(token, courseId);
-          return _fromSubs(
-            subs: subs,
+          final target = _pickSubForLesson(subs, lessonDate) ??
+              (subs.isNotEmpty ? subs.last : null);
+          final latestSubId = target?.subId ?? subId;
+          return ZhiyunResolve.ready(
             courseId: courseId,
+            latestSubId: latestSubId,
+            subCount: subs.length,
             title: asString(map?['title']) ?? courseName,
             realname: asString(map?['teacher']) ?? '',
-            lessonDate: lessonDate,
-            lessonEnd: lessonEnd,
+            exactDay:
+                target != null && _isSameDay(target.recordedAt, lessonDate),
           );
         } on ZhiyunException catch (error) {
           return ZhiyunResolve.error(error.message);
@@ -724,14 +722,14 @@ class ZhiyunService {
 
     try {
       return await _resolveWithToken(token, courseName, teacher,
-          lessonDate: lessonDate, lessonEnd: lessonEnd);
+          lessonDate: lessonDate);
     } on _ZhiyunUnauthorized {
       // token 失效：清缓存重登一次后重放。
       _reloginZhiyun();
       try {
         final fresh = await _getToken(username: username, password: password);
         return await _resolveWithToken(fresh, courseName, teacher,
-            lessonDate: lessonDate, lessonEnd: lessonEnd);
+            lessonDate: lessonDate);
       } on ZhiyunException catch (error) {
         return ZhiyunResolve.error(error.message);
       }
@@ -746,155 +744,29 @@ class ZhiyunService {
     return a.year == b.year && a.month == b.month && a.day == b.day;
   }
 
-  /// 智云课节是否已生成回放（Helechron checkHasReplay 同款）：
-  /// status_label 含「回放」/ status 3、4 / playback / video_url 非空 /
-  /// 已开课超过 1 小时且日期在过去。
-  static bool _subHasReplay(ZhiyunSub sub, {DateTime? now}) {
-    final t = now ?? DateTime.now();
-    final item = sub.raw;
-    final statusLabel = asString(item['status_label']) ?? '';
-    if (statusLabel == '回放' || statusLabel.contains('回放')) return true;
-    final status = asString(item['status']) ?? '';
-    if (status == '4' || status == '3') return true;
-    final playback = item['playback'];
-    if (playback != null &&
-        playback != false &&
-        playback.toString().isNotEmpty &&
-        playback.toString() != 'false') {
-      return true;
-    }
-    final videoUrl = item['video_url'] ?? item['play_url'] ?? item['m3u8'];
-    if (videoUrl != null && videoUrl.toString().isNotEmpty) return true;
-    // 时间维度：未来的课节绝无回放。
-    final startAt = sub.recordedAt;
-    if (startAt != null && startAt.isAfter(t)) return false;
-    // 未开始/正在直播状态不算回放。
-    if (statusLabel == '未开始' || statusLabel.contains('直播')) return false;
-    // 已开课超过 1 小时（回放转码完成）且无特定状态字段时视为有回放。
-    if (startAt != null && t.difference(startAt) > const Duration(hours: 1)) {
-      return true;
-    }
-    return false;
-  }
-
-  /// 智云课节是否正在直播（Helechron checkIsLive 同款）：
-  /// status_label「直播」/ is_live / status==2 / live_type==live；
-  /// 或当前处于课节窗口（前 10 分钟～后 10 分钟）且状态非回放/已结束。
-  static bool _subIsLive(ZhiyunSub sub,
-      {DateTime? lessonStart, DateTime? lessonEnd}) {
-    final t = DateTime.now();
-    final item = sub.raw;
-    final statusLabel = asString(item['status_label']) ?? '';
-    if (statusLabel == '直播' || statusLabel.contains('直播')) return true;
-    final isLiveField = item['is_live'];
-    if (isLiveField == true || isLiveField == 1 || isLiveField == '1') {
-      return true;
-    }
-    if (asString(item['status']) == '2') return true;
-    if (asString(item['live_type']) == 'live') return true;
-    // 时间维度：教务节次窗口或智云 start_at/end_at ±10 分钟。
-    DateTime? start = lessonStart ?? sub.recordedAt;
-    DateTime? end = lessonEnd;
-    if (start == null) return false;
-    if (end == null) {
-      final endAt = int.tryParse(asString(item['end_at']) ?? '');
-      if (endAt != null && endAt > 0) {
-        end = DateTime.fromMillisecondsSinceEpoch(
-            endAt > 100000000000 ? endAt : endAt * 1000);
-      }
-    }
-    end ??= start.add(const Duration(minutes: 50));
-    final inWindow = t.isAfter(start.subtract(const Duration(minutes: 10))) &&
-        t.isBefore(end.add(const Duration(minutes: 10)));
-    if (!inWindow) return false;
-    // 已生成回放或明确结束的不算直播。
-    if (statusLabel == '回放' || statusLabel == '已结束') return false;
-    if (asString(item['status']) == '4') return false;
-    return true;
-  }
-
-  /// 从课节目录决定卡片形态（Helechron getLessonReplay 同款）：
-  /// - 有 lessonDate：匹配同日课节，直播 → ready(live)；有回放 →
-  ///   ready(replay)；否则 notMatched（隐藏，绝不回退到别的课次）。
-  /// - 无 lessonDate：整门课存在直播课节或已生成回放的课节才 ready，
-  ///   目标取直播节，否则取最近一节有回放的；全部没有 → notMatched。
-  static ZhiyunResolve _fromSubs({
-    required List<ZhiyunSub> subs,
-    required int courseId,
-    required String title,
-    required String realname,
-    DateTime? lessonDate,
-    DateTime? lessonEnd,
-  }) {
-    if (lessonDate != null) {
-      // 同日精确匹配。
-      ZhiyunSub? matched;
-      for (final sub in subs) {
-        if (_isSameDay(sub.recordedAt, lessonDate)) {
-          matched = sub;
-          break;
-        }
-      }
-      if (matched == null) {
-        // 目录里可能有 title 含日期的课节（start_at 缺失时）。
-        final dateKey =
-            '${lessonDate.year}-${lessonDate.month.toString().padLeft(2, '0')}'
-            '-${lessonDate.day.toString().padLeft(2, '0')}';
-        final shortKey = '${lessonDate.month}月${lessonDate.day}日';
-        for (final sub in subs) {
-          if (sub.title.contains(dateKey) || sub.title.contains(shortKey)) {
-            matched = sub;
-            break;
-          }
-        }
-      }
-      if (matched == null) return const ZhiyunResolve.notMatched();
-      final live = _subIsLive(matched,
-          lessonStart: lessonDate, lessonEnd: lessonEnd);
-      final replay = live ? false : _subHasReplay(matched);
-      if (!live && !replay) return const ZhiyunResolve.notMatched();
-      return ZhiyunResolve.ready(
-        courseId: courseId,
-        latestSubId: matched.subId,
-        subCount: subs.length,
-        title: title,
-        realname: realname,
-        isLive: live,
-      );
-    }
-
-    // 整门课视角：优先直播节，其次最近一节有回放的课节。
-    ZhiyunSub? pick;
-    bool live = false;
+  /// 按上课日期精确匹配课节：优先同日，否则取最近一节早于上课日的；
+  /// 均无则返回 null（调用方回退到最新一节）。
+  static ZhiyunSub? _pickSubForLesson(List<ZhiyunSub> subs, DateTime? lessonDate) {
+    if (lessonDate == null || subs.isEmpty) return null;
+    final lessonDay = DateTime(lessonDate.year, lessonDate.month, lessonDate.day);
+    // 同日精确匹配。
     for (final sub in subs) {
-      if (_subIsLive(sub)) {
-        pick = sub;
-        live = true;
-        break;
+      if (_isSameDay(sub.recordedAt, lessonDate)) return sub;
+    }
+    // 无同日：取最晚的早于上课日的（上一次课的回放）。
+    ZhiyunSub? best;
+    for (final sub in subs) {
+      final d = sub.recordedAt;
+      if (d != null && d.isBefore(lessonDay)) {
+        best = sub;
       }
     }
-    if (pick == null) {
-      for (var i = subs.length - 1; i >= 0; i--) {
-        if (_subHasReplay(subs[i])) {
-          pick = subs[i];
-          break;
-        }
-      }
-    }
-    if (pick == null) return const ZhiyunResolve.notMatched();
-    return ZhiyunResolve.ready(
-      courseId: courseId,
-      latestSubId: pick.subId,
-      subCount: subs.length,
-      title: title,
-      realname: realname,
-      isLive: live,
-    );
+    return best;
   }
 
   static Future<ZhiyunResolve> _resolveWithToken(
       String token, String courseName, String? teacher,
-      {DateTime? lessonDate, DateTime? lessonEnd}) async {
+      {DateTime? lessonDate}) async {
     final matched = await _searchCourse(token, courseName, teacher);
     if (matched == null) {
       DiagnosticLogService.instance.record(
@@ -910,28 +782,27 @@ class ZhiyunService {
       return const ZhiyunResolve.notMatched(); // 没上/没生成回放 → 隐藏
     }
 
-    final resolve = _fromSubs(
-      subs: subs,
+    // 按上课日期精确匹配课节；无精确匹配回退到最新一节。
+    final targetSub = _pickSubForLesson(subs, lessonDate) ?? subs.last;
+    final exactDay = _isSameDay(targetSub.recordedAt, lessonDate);
+
+    final bindingKey = _bindingKey(courseName, teacher);
+    final binding = jsonEncode({
+      'course_id': matched.courseId,
+      'sub_id': targetSub.subId,
+      'title': matched.title,
+      'teacher': matched.realname,
+    });
+    _db?.setCachedWebPage(bindingKey, binding);
+
+    return ZhiyunResolve.ready(
       courseId: matched.courseId,
+      latestSubId: targetSub.subId,
+      subCount: subs.length,
       title: matched.title,
       realname: matched.realname,
-      lessonDate: lessonDate,
-      lessonEnd: lessonEnd,
+      exactDay: exactDay,
     );
-
-    // 绑定的 course_id 与最近一次可直达的课节，供下次进入秒开（显隐仍实时判定）。
-    if (resolve.kind == ZhiyunResolveKind.ready && resolve.latestSubId != null) {
-      final bindingKey = _bindingKey(courseName, teacher);
-      final binding = jsonEncode({
-        'course_id': matched.courseId,
-        'sub_id': resolve.latestSubId,
-        'title': matched.title,
-        'teacher': matched.realname,
-      });
-      _db?.setCachedWebPage(bindingKey, binding);
-    }
-
-    return resolve;
   }
 
   /// 直达 URL（播放间拼接规范）。
@@ -964,8 +835,8 @@ class ZhiyunResolve {
   final String realname;
   final String errorMessage;
 
-  /// ready 的课节是否处于直播态（false = 回放直达）。
-  final bool isLive;
+  /// 匹配到的回放是否就是请求日期当天的课次（false = 回退到最近一节）。
+  final bool exactDay;
 
   const ZhiyunResolve._({
     required this.kind,
@@ -975,7 +846,7 @@ class ZhiyunResolve {
     this.title = '',
     this.realname = '',
     this.errorMessage = '',
-    this.isLive = false,
+    this.exactDay = false,
   });
 
   const ZhiyunResolve.ready({
@@ -984,7 +855,7 @@ class ZhiyunResolve {
     required int subCount,
     required String title,
     required String realname,
-    bool isLive = false,
+    bool exactDay = false,
   }) : this._(
           kind: ZhiyunResolveKind.ready,
           courseId: courseId,
@@ -992,7 +863,7 @@ class ZhiyunResolve {
           subCount: subCount,
           title: title,
           realname: realname,
-          isLive: isLive,
+          exactDay: exactDay,
         );
 
   const ZhiyunResolve.notMatched() : this._(kind: ZhiyunResolveKind.notMatched);
@@ -1016,48 +887,20 @@ class ZhiyunCourse {
   });
 }
 
-/// 课节目录里的一条回放小节。raw 保留接口原始字段，
-/// 供回放/直播状态判定（status_label / video_url 等）使用。
+/// 课节目录里的一条回放小节。
 class ZhiyunSub {
   final int subId;
   final String title;
   final DateTime? recordedAt;
-  final Map<String, dynamic> raw;
 
   const ZhiyunSub({
     required this.subId,
     required this.title,
     required this.recordedAt,
-    this.raw = const {},
   });
 }
 
 // ===== 课程名称清洗与梯队匹配（Helechron 同款） =====
-
-/// 可录播性判定（Helechron isRecordableCourse 同款）：体育、实践等
-/// 非录播类课程坚决不展示智云卡片；理论类名词优先放行防误杀。
-/// 已有成功绑定的课程由调用方跳过此判定（不拦截真实存在过的课程）。
-bool isRecordableCourse(String courseName) {
-  final name = cleanCourseName(courseName);
-  const recordable = [
-    '军事理论', '理论', '概论', '研讨', '素养', '思修', '马原', '毛概', '史纲',
-  ];
-  for (final kw in recordable) {
-    if (name.contains(kw)) return true;
-  }
-  const nonRecordable = [
-    '体育', '身体素质', '体质健康', '体测', '体能', '专项', '太极', '游泳',
-    '篮球', '足球', '排球', '乒乓球', '羽毛球', '网球', '健美操', '武术',
-    '轮滑', '定向越野', '散打', '跆拳道', '击剑', '龙舟', '皮划艇', '瑜伽',
-    '形策', '形式与政策', '形势与政策', '军训', '军事技能', '生产实习',
-    '认知实习', '金工实习', '毕业设计', '毕业论文', '创新实践', '社会实践',
-    '劳动实践',
-  ];
-  for (final kw in nonRecordable) {
-    if (name.contains(kw)) return false;
-  }
-  return true;
-}
 
 /// 基础清洗：规整括号、剥末尾班级号与 -数字 后缀。
 String cleanCourseName(String courseName) {
